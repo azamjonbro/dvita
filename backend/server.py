@@ -75,6 +75,7 @@ class BranchIn(BaseModel):
     name: str
     code: str = ""
     address: str = ""
+    active: bool = True
 
 
 class RegisterCustomer(BaseModel):
@@ -111,6 +112,7 @@ class ProductIn(BaseModel):
     barcode: str = ""
     expiry_date: str = ""
     branch_id: Optional[str] = None
+    all_branches: bool = False
     parent_barcode: str = ""  # Eski barkod — variantlar bog'lanishi uchun
     sku: str = ""  # Ichki artikul — POS qidiruvida nom/shtrix-kod bilan birga ishlatiladi
     units_per_package: int = 0  # Qadoqdagi dona/tabletka soni (0 = nomdan avtomatik aniqlanadi)
@@ -334,6 +336,8 @@ async def login(data: LoginIn, response: Response):
         raise HTTPException(status_code=401, detail="Email yoki parol noto'g'ri")
     if user.get("branch_id"):
         branch = await db.branches.find_one({"id": user["branch_id"]}, {"_id": 0})
+        if branch and branch.get("active", True) is False:
+            raise HTTPException(status_code=403, detail="Sizning filialingiz vaqtincha ishlamayapti")
         if branch and not user.get("branch_name"):
             user["branch_name"] = branch.get("name")
     token = make_token(user["id"], user["email"], user["role"])
@@ -375,14 +379,14 @@ async def get_product_by_barcode(code: str, request: Request):
     query = {"barcode": trimmed, "deleted": {"$ne": True}}
     if user and user["role"] in ("admin", "worker"):
         if user.get("branch_id"):
-            query["branch_id"] = user["branch_id"]
+            query["$or"] = [{"all_branches": True}, {"branch_id": user["branch_id"]}]
         else:
             return []
     direct = await db.products.find(query, {"_id": 0}).to_list(50)
     variants_query = {"parent_barcode": trimmed, "deleted": {"$ne": True}}
     if user and user["role"] in ("admin", "worker"):
         if user.get("branch_id"):
-            variants_query["branch_id"] = user["branch_id"]
+            variants_query["$or"] = [{"all_branches": True}, {"branch_id": user["branch_id"]}]
         else:
             variants_query["branch_id"] = {"$exists": False}
     variants = await db.products.find(variants_query, {"_id": 0}).to_list(50)
@@ -415,7 +419,7 @@ async def list_products(
         target_branch = branch_id or user.get("branch_id")
         if not target_branch:
             return []
-        query["branch_id"] = target_branch
+        query["$and"] = [{"$or": [{"all_branches": True}, {"branch_id": target_branch}]}]
     elif user and user["role"] == "director" and branch_id:
         query["branch_id"] = branch_id
 
@@ -529,9 +533,9 @@ async def get_product(pid: str, request: Request):
     user = await try_current_user(request)
     if user and user["role"] in ("admin", "worker"):
         target_branch = user.get("branch_id")
-        if target_branch and p.get("branch_id") and p["branch_id"] != target_branch:
+        if target_branch and not p.get("all_branches") and p.get("branch_id") and p["branch_id"] != target_branch:
             raise HTTPException(status_code=403, detail="Bu filial mahsulitlarini ko'ra olmaysiz")
-        if target_branch and p.get("branch_id") is None:
+        if target_branch and not p.get("all_branches") and p.get("branch_id") is None:
             raise HTTPException(status_code=403, detail="Bu mahsulot filialga bog'lanmagan")
     hide = not (user and user["role"] in ("admin", "director"))
     return public_product(p, hide_cost=hide)
@@ -553,6 +557,7 @@ async def create_product(data: ProductIn, user=Depends(require_roles("admin", "d
         if not branch_id:
             raise HTTPException(400, "Mahsulot filialga biriktirilishi kerak")
         p["branch_id"] = branch_id
+        p["all_branches"] = False
     else:
         p["branch_id"] = p.get("branch_id")
     p["id"] = str(uuid.uuid4())
@@ -574,6 +579,7 @@ async def update_product(pid: str, data: ProductIn, user=Depends(require_roles("
             raise HTTPException(400, "Bu shtrix-kod boshqa mahsulotda mavjud")
     if user["role"] == "admin" and user.get("branch_id"):
         payload["branch_id"] = user["branch_id"]
+        payload["all_branches"] = False
 
     # Audit log
     old = await db.products.find_one({"id": pid}, {"_id": 0})
@@ -1031,6 +1037,7 @@ class BranchOut(BaseModel):
     code: str = ""
     address: str = ""
     created_at: str
+    active: bool = True
 
 
 @api.get("/branches")
@@ -1063,6 +1070,7 @@ async def create_branch(data: BranchIn, user=Depends(require_roles("director", "
         "name": data.name.strip(),
         "code": code,
         "address": data.address.strip(),
+        "active": data.active,
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
     await db.branches.insert_one(branch)
@@ -1083,6 +1091,7 @@ async def update_branch(bid: str, data: BranchIn, user=Depends(require_roles("di
         "name": data.name.strip(),
         "code": new_code,
         "address": data.address.strip(),
+        "active": data.active,
     }
     await db.branches.update_one({"id": bid}, {"$set": update})
     return {**existing, **update}
@@ -1229,14 +1238,17 @@ async def mark_notifications_seen(user=Depends(get_current_user)):
 
 # ---------- Stats ----------
 @api.get("/stats/overview")
-async def stats_overview(user=Depends(require_roles("director"))):
-    total_orders = await db.orders.count_documents({})
-    total_sales = await db.sales.count_documents({})
+async def stats_overview(branch_id: Optional[str] = None, user=Depends(require_roles("director"))):
+    if branch_id and not await db.branches.find_one({"id": branch_id}):
+        raise HTTPException(status_code=404, detail="Filial topilmadi")
+    branch_match = {"branch_id": branch_id} if branch_id else {}
+    total_orders = await db.orders.count_documents(branch_match)
+    total_sales = await db.sales.count_documents(branch_match)
     total_customers = await db.users.count_documents({"role": "customer"})
     total_workers = await db.users.count_documents({"role": "worker"})
 
     # Sales aggregation — "total" maydoni bo'yicha yig'amiz
-    sales_agg = await db.sales.aggregate([
+    sales_agg = await db.sales.aggregate(([{"$match": branch_match}] if branch_match else []) + [
         {"$group": {
             "_id": None,
             "revenue": {"$sum": {"$ifNull": ["$total", 0]}},
@@ -1248,7 +1260,7 @@ async def stats_overview(user=Depends(require_roles("director"))):
     sales_stats = sales_agg[0] if sales_agg else {"revenue": 0, "cost": 0, "profit": 0, "discount": 0}
 
     # Orders aggregation
-    orders_agg = await db.orders.aggregate([
+    orders_agg = await db.orders.aggregate(([{"$match": branch_match}] if branch_match else []) + [
         {"$group": {
             "_id": None,
             "revenue": {"$sum": {"$ifNull": ["$total", 0]}},
@@ -1260,7 +1272,7 @@ async def stats_overview(user=Depends(require_roles("director"))):
     orders_stats = orders_agg[0] if orders_agg else {"revenue": 0, "cost": 0, "profit": 0, "discount": 0}
 
     # Per-worker
-    per_worker = await db.sales.aggregate([
+    per_worker = await db.sales.aggregate(([{"$match": branch_match}] if branch_match else []) + [
         {"$group": {
             "_id": "$worker_id",
             "worker_name": {"$first": "$worker_name"},
@@ -1275,8 +1287,9 @@ async def stats_overview(user=Depends(require_roles("director"))):
 
     # Daily last 14 days
     cutoff = (datetime.now(timezone.utc) - timedelta(days=14)).isoformat()
+    daily_match = {**branch_match, "created_at": {"$gte": cutoff}}
     daily = await db.sales.aggregate([
-        {"$match": {"created_at": {"$gte": cutoff}}},
+        {"$match": daily_match},
         {"$group": {
             "_id": {"$substr": ["$created_at", 0, 10]},
             "revenue": {"$sum": {"$ifNull": ["$total", 0]}},
@@ -1290,7 +1303,7 @@ async def stats_overview(user=Depends(require_roles("director"))):
               "discount": d.get("discount", 0), "count": d["count"]} for d in daily]
 
     # Monthly last 12
-    monthly = await db.sales.aggregate([
+    monthly = await db.sales.aggregate(([{"$match": branch_match}] if branch_match else []) + [
         {"$group": {
             "_id": {"$substr": ["$created_at", 0, 7]},
             "revenue": {"$sum": {"$ifNull": ["$total", 0]}},
@@ -1307,7 +1320,7 @@ async def stats_overview(user=Depends(require_roles("director"))):
     } for m in monthly]))
 
     # Top products
-    top_products = await db.sales.aggregate([
+    top_products = await db.sales.aggregate(([{"$match": branch_match}] if branch_match else []) + [
         {"$group": {
             "_id": "$product_id",
             "name": {"$first": "$product_name"},

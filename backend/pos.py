@@ -219,6 +219,11 @@ def build_pos_router(*, db, client, require_roles: Callable, public_product: Cal
         """Nom, SKU yoki shtrix-kod bo'yicha tezkor qidiruv. Aniq kod mosligi birinchi chiqadi."""
         term = (q or "").strip()
         base = {"deleted": {"$ne": True}}
+        branch_id = user.get("branch_id")
+        if branch_id:
+            base["$or"] = [{"all_branches": True}, {"branch_id": branch_id}]
+        else:
+            return []
         if not term:
             items = await db.products.find(base, {"_id": 0}).sort("name", 1).limit(limit).to_list(length=None)
         else:
@@ -226,11 +231,11 @@ def build_pos_router(*, db, client, require_roles: Callable, public_product: Cal
                 return []
             prefix = {"$regex": f"^{re.escape(term)}", "$options": "i"}
             exact = await db.products.find(
-                {**base, "$or": [{"barcode": term}, {"sku": term}]}, {"_id": 0}
+                {"$and": [base, {"$or": [{"barcode": term}, {"sku": term}]}]}, {"_id": 0}
             ).limit(limit).to_list(length=None)
             exact_ids = {p["id"] for p in exact}
             rest = await db.products.find(
-                {**base, "$or": [{"name": prefix}, {"sku": prefix}, {"barcode": prefix}, {"manufacturer": prefix}]},
+                {"$and": [base, {"$or": [{"name": prefix}, {"sku": prefix}, {"barcode": prefix}, {"manufacturer": prefix}]}]},
                 {"_id": 0},
             ).sort("name", 1).limit(limit).to_list(length=None)
             items = exact + [p for p in rest if p["id"] not in exact_ids]
