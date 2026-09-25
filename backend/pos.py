@@ -220,17 +220,19 @@ def build_pos_router(*, db, client, require_roles: Callable, public_product: Cal
         term = (q or "").strip()
         base = {"deleted": {"$ne": True}}
         if not term:
-            items = await db.products.find(base, {"_id": 0}).sort("name", 1).to_list(limit)
+            items = await db.products.find(base, {"_id": 0}).sort("name", 1).limit(limit).to_list(length=None)
         else:
-            rx = {"$regex": re.escape(term), "$options": "i"}
+            if len(term) < 2 and not term.isdigit():
+                return []
+            prefix = {"$regex": f"^{re.escape(term)}", "$options": "i"}
             exact = await db.products.find(
                 {**base, "$or": [{"barcode": term}, {"sku": term}]}, {"_id": 0}
-            ).to_list(limit)
+            ).limit(limit).to_list(length=None)
             exact_ids = {p["id"] for p in exact}
             rest = await db.products.find(
-                {**base, "$or": [{"name": rx}, {"sku": rx}, {"barcode": rx}, {"manufacturer": rx}]},
+                {**base, "$or": [{"name": prefix}, {"sku": prefix}, {"barcode": prefix}, {"manufacturer": prefix}]},
                 {"_id": 0},
-            ).sort("name", 1).to_list(limit + len(exact_ids))
+            ).sort("name", 1).limit(limit).to_list(length=None)
             items = exact + [p for p in rest if p["id"] not in exact_ids]
             items = items[:limit]
         out = []
@@ -788,6 +790,11 @@ async def ensure_pos_indexes(db):
     await db.follow_ups.create_index("customer_id")
     await db.follow_ups.create_index("sale_id")
     await db.products.create_index("sku")
+    await db.products.create_index([("deleted", 1), ("name", 1)])
+    await db.products.create_index([("deleted", 1), ("barcode", 1)])
+    await db.products.create_index([("deleted", 1), ("sku", 1)])
+    await db.products.create_index([("deleted", 1), ("category", 1)])
+    await db.products.create_index([("deleted", 1), ("manufacturer", 1)])
 
 
 async def backfill_units_per_package(db):

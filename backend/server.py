@@ -5,11 +5,14 @@ ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
 
 import os
+import re
 import uuid
 import asyncio
 import logging
+import math
 import bcrypt
 import jwt as pyjwt
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone, timedelta
 from typing import List, Optional, Literal
 
@@ -35,7 +38,15 @@ JWT_ALGO = "HS256"
 logger = logging.getLogger("server")
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-app = FastAPI(title="Glow Cosmetics API")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await seed_initial_data()
+    logger.info("Glow Cosmetics API ready")
+    yield
+    client.close()
+
+
+app = FastAPI(title="Glow Cosmetics API", lifespan=lifespan)
 api = APIRouter(prefix="/api")
 
 
@@ -55,7 +66,15 @@ class UserOut(BaseModel):
     surname: Optional[str] = ""
     phone: Optional[str] = ""
     role: Role
+    branch_id: Optional[str] = None
+    branch_name: Optional[str] = None
     created_at: str
+
+
+class BranchIn(BaseModel):
+    name: str
+    code: str = ""
+    address: str = ""
 
 
 class RegisterCustomer(BaseModel):
@@ -77,6 +96,7 @@ class CreateWorker(BaseModel):
     name: str
     surname: str = ""
     phone: str = ""
+    branch_id: Optional[str] = None
 
 
 class ProductIn(BaseModel):
@@ -90,6 +110,7 @@ class ProductIn(BaseModel):
     stock: int = 100
     barcode: str = ""
     expiry_date: str = ""
+    branch_id: Optional[str] = None
     parent_barcode: str = ""  # Eski barkod — variantlar bog'lanishi uchun
     sku: str = ""  # Ichki artikul — POS qidiruvida nom/shtrix-kod bilan birga ishlatiladi
     units_per_package: int = 0  # Qadoqdagi dona/tabletka soni (0 = nomdan avtomatik aniqlanadi)
@@ -157,15 +178,67 @@ def make_token(user_id: str, email: str, role: str) -> str:
 
 
 def serialize_user(u: dict) -> dict:
-    return {
+    out = {
         "id": u["id"],
         "email": u["email"],
         "name": u.get("name", ""),
         "surname": u.get("surname", ""),
         "phone": u.get("phone", ""),
         "role": u["role"],
+        "branch_id": u.get("branch_id"),
+        "branch_name": u.get("branch_name"),
         "created_at": u.get("created_at", datetime.now(timezone.utc).isoformat()),
     }
+    return out
+
+
+async def get_branch_name(branch_id: Optional[str]) -> Optional[str]:
+    if not branch_id:
+        return None
+    branch = await db.branches.find_one({"id": branch_id}, {"_id": 0})
+    return branch.get("name") if branch else None
+
+
+async def ensure_branch_access(user: dict, branch_id: Optional[str] = None, allow_missing: bool = False):
+    if user.get("role") == "director":
+        return
+    my_branch = user.get("branch_id")
+    target = branch_id or my_branch
+    if not target:
+        if allow_missing:
+            return
+        raise HTTPException(status_code=403, detail="Filial tanlanmagan")
+    if my_branch and target != my_branch:
+        raise HTTPException(status_code=403, detail="Siz ushbu filial mahsulotlarini ko'ra olmaysiz")
+    if not my_branch and user.get("role") == "admin":
+        return
+    if not my_branch and user.get("role") == "worker":
+        raise HTTPException(status_code=403, detail="Ishchi filialsiz ishlay olmaydi")
+
+
+def apply_branch_filter_to_query(query: dict, user: dict, requested_branch_id: Optional[str] = None):
+    if user.get("role") == "director":
+        if requested_branch_id:
+            query["branch_id"] = requested_branch_id
+        return query
+    target_branch = requested_branch_id or user.get("branch_id")
+    if not target_branch:
+        query["branch_id"] = {"$exists": False}
+        return query
+    query["branch_id"] = target_branch
+    return query
+
+
+def normalize_image_url(url: Optional[str]) -> str:
+    fallback = "https://images.unsplash.com/photo-1522335789203-aabd1fc54bc9?auto=format&fit=crop&w=900&q=80"
+    if not url or not isinstance(url, str):
+        return fallback
+    cleaned = url.strip()
+    if not cleaned:
+        return fallback
+    if cleaned.startswith(("http://", "https://", "data:", "/")):
+        return cleaned
+    return fallback
 
 
 def effective_price(product: dict) -> float:
@@ -183,6 +256,7 @@ def public_product(p: dict, hide_cost: bool = True) -> dict:
     out.pop("_id", None)
     if hide_cost:
         out.pop("cost_price", None)
+    out["image_url"] = normalize_image_url(out.get("image_url"))
     out["final_price"] = effective_price(p)
     out["discount_amount"] = round(float(p.get("price", 0) or 0) - out["final_price"], 2)
     return out
@@ -258,6 +332,10 @@ async def login(data: LoginIn, response: Response):
     user = await db.users.find_one({"email": email}, {"_id": 0})
     if not user or not verify_password(data.password, user["password_hash"]):
         raise HTTPException(status_code=401, detail="Email yoki parol noto'g'ri")
+    if user.get("branch_id"):
+        branch = await db.branches.find_one({"id": user["branch_id"]}, {"_id": 0})
+        if branch and not user.get("branch_name"):
+            user["branch_name"] = branch.get("name")
     token = make_token(user["id"], user["email"], user["role"])
     set_auth_cookie(response, token)
     return {"user": serialize_user(user), "token": token}
@@ -294,12 +372,20 @@ async def get_product_by_barcode(code: str, request: Request):
     trimmed = code.strip()
     user = await try_current_user(request)
     hide = not (user and user["role"] in ("admin", "director", "worker"))
-    direct = await db.products.find(
-        {"barcode": trimmed, "deleted": {"$ne": True}}, {"_id": 0}
-    ).to_list(50)
-    variants = await db.products.find(
-        {"parent_barcode": trimmed, "deleted": {"$ne": True}}, {"_id": 0}
-    ).to_list(50)
+    query = {"barcode": trimmed, "deleted": {"$ne": True}}
+    if user and user["role"] in ("admin", "worker"):
+        if user.get("branch_id"):
+            query["branch_id"] = user["branch_id"]
+        else:
+            return []
+    direct = await db.products.find(query, {"_id": 0}).to_list(50)
+    variants_query = {"parent_barcode": trimmed, "deleted": {"$ne": True}}
+    if user and user["role"] in ("admin", "worker"):
+        if user.get("branch_id"):
+            variants_query["branch_id"] = user["branch_id"]
+        else:
+            variants_query["branch_id"] = {"$exists": False}
+    variants = await db.products.find(variants_query, {"_id": 0}).to_list(50)
     all_products = direct + variants
     if not all_products:
         raise HTTPException(404, "Bu kod boyicha mahsulot topilmadi")
@@ -307,15 +393,107 @@ async def get_product_by_barcode(code: str, request: Request):
 
 
 @api.get("/products")
-async def list_products(request: Request, search: str = "", include_deleted: bool = False):
+async def list_products(
+    request: Request,
+    search: str = "",
+    include_deleted: bool = False,
+    limit: int = 40,
+    page: int = 1,
+    stock_status: str = "all",
+    price_min: Optional[float] = None,
+    price_max: Optional[float] = None,
+    sort: str = "newest",
+    branch_id: Optional[str] = None,
+):
+    limit = max(1, min(int(limit), 50))
+    page = max(1, int(page))
     query = {} if include_deleted else {"deleted": {"$ne": True}}
-    if search and search.strip():
-        rx = {"$regex": search.strip(), "$options": "i"}
-        query["$or"] = [{"name": rx}, {"barcode": rx}, {"sku": rx}, {"category": rx}, {"description": rx}]
-    items = await db.products.find(query, {"_id": 0}).sort("created_at", -1).to_list(1000)
     user = await try_current_user(request)
+    if user and user["role"] in ("admin", "worker"):
+        if branch_id and user.get("branch_id") and branch_id != user["branch_id"]:
+            raise HTTPException(status_code=403, detail="Bu filial mahsulotlarini ko'ra olmaysiz")
+        target_branch = branch_id or user.get("branch_id")
+        if not target_branch:
+            return []
+        query["branch_id"] = target_branch
+    elif user and user["role"] == "director" and branch_id:
+        query["branch_id"] = branch_id
+
+    if stock_status == "in_stock":
+        query["stock"] = {"$gt": 0}
+    elif stock_status == "out_of_stock":
+        query["stock"] = 0
+    elif stock_status == "low_stock":
+        query["stock"] = {"$gt": 0, "$lte": 5}
+
+    if price_min is not None:
+        min_value = float(price_min)
+        existing = query.get("price")
+        if isinstance(existing, dict):
+            existing["$gte"] = min_value
+            query["price"] = existing
+        else:
+            query["price"] = {"$gte": min_value}
+
+    if price_max is not None:
+        max_value = float(price_max)
+        existing = query.get("price")
+        if isinstance(existing, dict):
+            existing["$lte"] = max_value
+            query["price"] = existing
+        else:
+            query["price"] = {"$lte": max_value}
+
+    if search and search.strip():
+        term = search.strip()[:80]
+        if len(term) < 2 and not term.isdigit():
+            return []
+
+        prefix = {"$regex": f"^{re.escape(term)}", "$options": "i"}
+        query["$or"] = [
+            {"name": prefix},
+            {"sku": prefix},
+            {"barcode": prefix},
+            {"category": prefix},
+            {"description": prefix},
+        ]
+
+    sort_field = "created_at"
+    sort_direction = -1
+    if sort == "price_asc":
+        sort_field = "price"
+        sort_direction = 1
+    elif sort == "price_desc":
+        sort_field = "price"
+        sort_direction = -1
+    elif sort == "stock_asc":
+        sort_field = "stock"
+        sort_direction = 1
+    elif sort == "stock_desc":
+        sort_field = "stock"
+        sort_direction = -1
+
+    total = await db.products.count_documents(query)
+    skip = (page - 1) * limit
+    items = await db.products.find(query, {"_id": 0}).sort(sort_field, sort_direction).skip(skip).limit(limit).to_list(length=None)
+
     hide = not (user and user["role"] in ("admin", "director"))
-    return [public_product(p, hide_cost=hide) for p in items]
+    result = [public_product(p, hide_cost=hide) for p in items]
+
+    is_paginated = any(
+        key in request.query_params
+        for key in ["page", "limit", "stock_status", "price_min", "price_max", "sort"]
+    )
+    if is_paginated:
+        total_pages = max(1, math.ceil(total / limit)) if total else 1
+        return {
+            "items": result,
+            "page": page,
+            "limit": limit,
+            "total": total,
+            "total_pages": total_pages,
+        }
+    return result
 
 
 @api.get("/products/deleted")
@@ -349,12 +527,18 @@ async def get_product(pid: str, request: Request):
     if not p:
         raise HTTPException(404, "Mahsulot topilmadi")
     user = await try_current_user(request)
+    if user and user["role"] in ("admin", "worker"):
+        target_branch = user.get("branch_id")
+        if target_branch and p.get("branch_id") and p["branch_id"] != target_branch:
+            raise HTTPException(status_code=403, detail="Bu filial mahsulitlarini ko'ra olmaysiz")
+        if target_branch and p.get("branch_id") is None:
+            raise HTTPException(status_code=403, detail="Bu mahsulot filialga bog'lanmagan")
     hide = not (user and user["role"] in ("admin", "director"))
     return public_product(p, hide_cost=hide)
 
 
 @api.post("/products")
-async def create_product(data: ProductIn, user=Depends(require_roles("admin"))):
+async def create_product(data: ProductIn, user=Depends(require_roles("admin", "director"))):
     p = data.model_dump()
     if p["price"] < 0 or p["cost_price"] < 0:
         raise HTTPException(400, "Narx manfiy bo'lmasligi kerak")
@@ -364,6 +548,13 @@ async def create_product(data: ProductIn, user=Depends(require_roles("admin"))):
         exists = await db.products.find_one({"barcode": p["barcode"]})
         if exists:
             raise HTTPException(400, "Bu shtrix-kod allaqachon mavjud")
+    if user.get("role") == "admin":
+        branch_id = p.get("branch_id") or user.get("branch_id")
+        if not branch_id:
+            raise HTTPException(400, "Mahsulot filialga biriktirilishi kerak")
+        p["branch_id"] = branch_id
+    else:
+        p["branch_id"] = p.get("branch_id")
     p["id"] = str(uuid.uuid4())
     p["created_at"] = datetime.now(timezone.utc).isoformat()
     await db.products.insert_one(p)
@@ -371,7 +562,7 @@ async def create_product(data: ProductIn, user=Depends(require_roles("admin"))):
 
 
 @api.put("/products/{pid}")
-async def update_product(pid: str, data: ProductIn, user=Depends(require_roles("admin"))):
+async def update_product(pid: str, data: ProductIn, user=Depends(require_roles("admin", "director"))):
     payload = data.model_dump()
     if payload["price"] < 0 or payload["cost_price"] < 0:
         raise HTTPException(400, "Narx manfiy bo'lmasligi kerak")
@@ -381,6 +572,8 @@ async def update_product(pid: str, data: ProductIn, user=Depends(require_roles("
         exists = await db.products.find_one({"barcode": payload["barcode"], "id": {"$ne": pid}})
         if exists:
             raise HTTPException(400, "Bu shtrix-kod boshqa mahsulotda mavjud")
+    if user["role"] == "admin" and user.get("branch_id"):
+        payload["branch_id"] = user["branch_id"]
 
     # Audit log
     old = await db.products.find_one({"id": pid}, {"_id": 0})
@@ -417,7 +610,7 @@ async def update_product(pid: str, data: ProductIn, user=Depends(require_roles("
 
 
 @api.delete("/products/{pid}")
-async def delete_product(pid: str, user=Depends(require_roles("admin"))):
+async def delete_product(pid: str, user=Depends(require_roles("admin", "director"))):
     """Soft delete: mahsulot 'deleted' deb belgilanadi, qaytarib olish mumkin."""
     await db.products.update_one(
         {"id": pid},
@@ -427,7 +620,7 @@ async def delete_product(pid: str, user=Depends(require_roles("admin"))):
 
 
 @api.post("/products/{pid}/restore")
-async def restore_product(pid: str, user=Depends(require_roles("admin"))):
+async def restore_product(pid: str, user=Depends(require_roles("admin", "director"))):
     await db.products.update_one(
         {"id": pid},
         {"$set": {"deleted": False}, "$unset": {"deleted_at": ""}},
@@ -562,6 +755,8 @@ async def create_sale(data: SaleIn, user=Depends(require_roles("worker"))):
         "id": str(uuid.uuid4()),
         "worker_id": user["id"],
         "worker_name": f"{user.get('name','')} {user.get('surname','')}".strip(),
+        "branch_id": user.get("branch_id"),
+        "branch_name": user.get("branch_name") or (await get_branch_name(user.get("branch_id"))),
         "customer_name": data.customer_name,
         "customer_surname": data.customer_surname,
         "customer_phone": data.customer_phone,
@@ -661,6 +856,8 @@ async def create_multi_sale(data: MultiSaleIn, user=Depends(require_roles("worke
             "receipt_id": receipt_id,
             "worker_id": user["id"],
             "worker_name": f"{user.get('name','')} {user.get('surname','')}".strip(),
+            "branch_id": user.get("branch_id"),
+            "branch_name": user.get("branch_name") or (await get_branch_name(user.get("branch_id"))),
             "customer_name": data.customer_name,
             "customer_surname": data.customer_surname,
             "customer_phone": data.customer_phone,
@@ -732,8 +929,25 @@ async def my_sales(user=Depends(require_roles("worker"))):
 
 
 @api.get("/sales/all")
-async def all_sales(user=Depends(require_roles("director"))):
-    return await db.sales.find({}, {"_id": 0}).sort("created_at", -1).to_list(5000)
+async def all_sales(
+    user=Depends(require_roles("director", "admin")),
+    branch_id: Optional[str] = None,
+    worker_id: Optional[str] = None,
+):
+    query = {}
+    if user["role"] == "admin":
+        target_branch = branch_id or user.get("branch_id")
+        if target_branch and target_branch != user.get("branch_id"):
+            raise HTTPException(status_code=403, detail="Bu filial sotuvlarini ko'ra olmaysiz")
+        if user.get("branch_id"):
+            query["branch_id"] = user["branch_id"]
+        elif target_branch:
+            query["branch_id"] = target_branch
+    elif branch_id:
+        query["branch_id"] = branch_id
+    if worker_id:
+        query["worker_id"] = worker_id
+    return await db.sales.find(query, {"_id": 0}).sort("created_at", -1).to_list(5000)
 
 
 @api.post("/sales/{sid}/follow-up-done")
@@ -810,26 +1024,125 @@ async def my_attendance(user=Depends(require_roles("worker"))):
     return await db.attendance.find({"worker_id": user["id"]}, {"_id": 0}).sort("timestamp", -1).to_list(1000)
 
 
+# ---------- Branches ----------
+class BranchOut(BaseModel):
+    id: str
+    name: str
+    code: str = ""
+    address: str = ""
+    created_at: str
+
+
+@api.get("/branches")
+async def list_branches(request: Request, user=Depends(get_current_user)):
+    if user["role"] == "director":
+        branches = await db.branches.find({}, {"_id": 0}).sort("created_at", -1).to_list(500)
+        return branches
+    if user["role"] == "admin":
+        if user.get("branch_id"):
+            return await db.branches.find({"id": user["branch_id"]}, {"_id": 0}).to_list(50)
+        branches = await db.branches.find({}, {"_id": 0}).sort("created_at", -1).to_list(500)
+        return branches
+    branch_id = user.get("branch_id")
+    if not branch_id:
+        return []
+    return await db.branches.find({"id": branch_id}, {"_id": 0}).to_list(50)
+
+
+@api.post("/branches")
+async def create_branch(data: BranchIn, user=Depends(require_roles("director", "admin"))):
+    if user["role"] == "admin" and user.get("branch_id"):
+        raise HTTPException(status_code=403, detail="Admin filial yaratolmaydi")
+    code = (data.code or data.name).strip()
+    if not code:
+        raise HTTPException(status_code=400, detail="Filial kodi yoki nomi bo'sh bo'lmasligi kerak")
+    if await db.branches.find_one({"code": code}):
+        raise HTTPException(status_code=400, detail="Bunday filial kodi allaqachon mavjud")
+    branch = {
+        "id": str(uuid.uuid4()),
+        "name": data.name.strip(),
+        "code": code,
+        "address": data.address.strip(),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    await db.branches.insert_one(branch)
+    return {key: value for key, value in branch.items() if key != "_id"}
+
+
+@api.put("/branches/{bid}")
+async def update_branch(bid: str, data: BranchIn, user=Depends(require_roles("director", "admin"))):
+    if user["role"] == "admin" and user.get("branch_id") and bid != user["branch_id"]:
+        raise HTTPException(status_code=403, detail="Siz boshqa filialni o'zgartira olmaysiz")
+    existing = await db.branches.find_one({"id": bid}, {"_id": 0})
+    if not existing:
+        raise HTTPException(status_code=404, detail="Filial topilmadi")
+    new_code = (data.code or data.name).strip()
+    if new_code and await db.branches.find_one({"code": new_code, "id": {"$ne": bid}}):
+        raise HTTPException(status_code=400, detail="Bunday filial kodi allaqachon mavjud")
+    update = {
+        "name": data.name.strip(),
+        "code": new_code,
+        "address": data.address.strip(),
+    }
+    await db.branches.update_one({"id": bid}, {"$set": update})
+    return {**existing, **update}
+
+
+@api.delete("/branches/{bid}")
+async def delete_branch(bid: str, user=Depends(require_roles("director", "admin"))):
+    if user["role"] == "admin" and user.get("branch_id") and bid != user["branch_id"]:
+        raise HTTPException(status_code=403, detail="Siz boshqa filialni o'chira olmaysiz")
+    branch = await db.branches.find_one({"id": bid}, {"_id": 0})
+    if not branch:
+        raise HTTPException(status_code=404, detail="Filial topilmadi")
+    await db.users.update_many({"branch_id": bid}, {"$set": {"branch_id": None, "branch_name": None}})
+    await db.products.update_many({"branch_id": bid}, {"$set": {"branch_id": None}})
+    await db.sales.update_many({"branch_id": bid}, {"$set": {"branch_id": None}})
+    await db.branches.delete_one({"id": bid})
+    return {"ok": True}
+
+
 # ---------- Users ----------
 @api.get("/users")
-async def list_users(user=Depends(require_roles("director"))):
-    users = await db.users.find({}, {"_id": 0, "password_hash": 0}).sort("created_at", -1).to_list(5000)
+async def list_users(user=Depends(require_roles("director", "admin"))):
+    query = {}
+    if user["role"] == "admin" and user.get("branch_id"):
+        query["branch_id"] = user["branch_id"]
+    users = await db.users.find(query, {"_id": 0, "password_hash": 0}).sort("created_at", -1).to_list(5000)
     return users
 
 
 @api.get("/users/workers")
 async def list_workers(user=Depends(require_roles("director", "worker", "admin"))):
-    return await db.users.find({"role": "worker"}, {"_id": 0, "password_hash": 0}).to_list(100)
+    query = {"role": "worker"}
+    if user["role"] == "worker" and user.get("branch_id"):
+        query["branch_id"] = user["branch_id"]
+    elif user["role"] == "admin" and user.get("branch_id"):
+        query["branch_id"] = user["branch_id"]
+    return await db.users.find(query, {"_id": 0, "password_hash": 0}).to_list(100)
 
 
 @api.post("/users/workers")
-async def create_worker(data: CreateWorker, user=Depends(require_roles("director"))):
+async def create_worker(data: CreateWorker, user=Depends(require_roles("director", "admin"))):
     count = await db.users.count_documents({"role": "worker"})
     if count >= 4:
         raise HTTPException(400, "Maksimal 4 ta ishchi bo'lishi mumkin")
     email = data.email.lower()
     if await db.users.find_one({"email": email}):
         raise HTTPException(400, "Bu email allaqachon mavjud")
+    branch_id = data.branch_id or user.get("branch_id")
+    if user["role"] == "admin" and branch_id and branch_id != user.get("branch_id"):
+        raise HTTPException(status_code=403, detail="Admin boshqa filialga ishchi qo'sha olmaydi")
+    if user["role"] == "admin" and not branch_id:
+        raise HTTPException(status_code=400, detail="Ishchi filialga biriktirilishi kerak")
+    if not branch_id:
+        branch = await db.branches.find_one({}, {"_id": 0})
+        if branch:
+            branch_id = branch["id"]
+    branch_name = None
+    if branch_id:
+        branch = await db.branches.find_one({"id": branch_id}, {"_id": 0})
+        branch_name = branch.get("name") if branch else branch_name
     w = {
         "id": str(uuid.uuid4()),
         "email": email,
@@ -838,6 +1151,8 @@ async def create_worker(data: CreateWorker, user=Depends(require_roles("director
         "surname": data.surname,
         "phone": data.phone,
         "role": "worker",
+        "branch_id": branch_id,
+        "branch_name": branch_name,
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
     await db.users.insert_one(w)
@@ -845,7 +1160,12 @@ async def create_worker(data: CreateWorker, user=Depends(require_roles("director
 
 
 @api.delete("/users/workers/{wid}")
-async def delete_worker(wid: str, user=Depends(require_roles("director"))):
+async def delete_worker(wid: str, user=Depends(require_roles("director", "admin"))):
+    target = await db.users.find_one({"id": wid, "role": "worker"}, {"_id": 0})
+    if not target:
+        raise HTTPException(404, "Ishchi topilmadi")
+    if user["role"] == "admin" and user.get("branch_id") and target.get("branch_id") and target["branch_id"] != user["branch_id"]:
+        raise HTTPException(status_code=403, detail="Bu filial ishchisini o'chira olmaysiz")
     res = await db.users.delete_one({"id": wid, "role": "worker"})
     if res.deleted_count == 0:
         raise HTTPException(404, "Ishchi topilmadi")
@@ -1110,6 +1430,11 @@ async def seed_initial_data():
     await db.users.create_index("email", unique=True)
     await db.products.create_index("id", unique=True)
     await db.products.create_index("barcode")
+    await db.products.create_index([("deleted", 1), ("barcode", 1)])
+    await db.products.create_index([("deleted", 1), ("sku", 1)])
+    await db.products.create_index([("deleted", 1), ("name", 1)])
+    await db.products.create_index([("deleted", 1), ("category", 1)])
+    await db.products.create_index([("deleted", 1), ("parent_barcode", 1)])
     await db.orders.create_index("created_at")
     await db.sales.create_index("worker_id")
     await db.sales.create_index("follow_up_due_at")
@@ -1269,12 +1594,13 @@ async def seed_initial_data():
             await db.news.insert_one(n)
 
 
-@app.on_event("startup")
-async def on_startup():
-    await seed_initial_data()
-    logger.info("Glow Cosmetics API ready")
+if __name__ == "__main__":
+    import uvicorn
 
+    uvicorn.run(
+        "server:app",
+        host="0.0.0.0",
+        port=int(os.environ.get("PORT", "8000")),
+        reload=False,
+    )
 
-@app.on_event("shutdown")
-async def on_shutdown():
-    client.close()

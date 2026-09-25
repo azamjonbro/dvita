@@ -96,6 +96,54 @@ class TestProductSearch:
         assert r.status_code == 200
         assert r.json() == []
 
+    def test_pagination_and_filters_work(self, admin_client):
+        created = []
+        for idx, (name, price, stock) in enumerate([
+            (f"TEST_PAG_1_{uuid.uuid4().hex[:6]}", 150, 0),
+            (f"TEST_PAG_2_{uuid.uuid4().hex[:6]}", 300, 4),
+            (f"TEST_PAG_3_{uuid.uuid4().hex[:6]}", 550, 7),
+            (f"TEST_PAG_4_{uuid.uuid4().hex[:6]}", 750, 1),
+        ]):
+            payload = {
+                "name": name,
+                "description": "pag test",
+                "price": price,
+                "image_url": "https://x",
+                "category": "test",
+                "stock": stock,
+                "barcode": f"TESTPAG_{uuid.uuid4().hex[:8]}",
+            }
+            r = admin_client.post(f"{BASE_URL}/api/products", json=payload)
+            assert r.status_code == 200, r.text
+            created.append(r.json())
+
+        r = admin_client.get(
+            f"{BASE_URL}/api/products",
+            params={"page": 1, "limit": 2, "price_min": 200, "price_max": 600},
+        )
+        assert r.status_code == 200, r.text
+        data = r.json()
+        assert isinstance(data, dict)
+        assert data["page"] == 1
+        assert len(data["items"]) <= 2
+        assert all(200 <= p["price"] <= 600 for p in data["items"])
+        assert data["total"] >= 1
+
+        out = admin_client.get(f"{BASE_URL}/api/products", params={"stock_status": "out_of_stock", "limit": 20})
+        assert out.status_code == 200, out.text
+        out_data = out.json()
+        items = out_data["items"] if isinstance(out_data, dict) else out_data
+        assert all(p["stock"] == 0 for p in items)
+
+        low = admin_client.get(f"{BASE_URL}/api/products", params={"stock_status": "low_stock", "limit": 20})
+        assert low.status_code == 200, low.text
+        low_data = low.json()
+        low_items = low_data["items"] if isinstance(low_data, dict) else low_data
+        assert all(0 < p["stock"] <= 5 for p in low_items)
+
+        for p in created:
+            admin_client.delete(f"{BASE_URL}/api/products/{p['id']}")
+
 
 # ---------- Soft delete + restore + deleted list ----------
 class TestSoftDeleteRestore:
