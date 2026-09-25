@@ -230,6 +230,7 @@ def build_pos_router(*, db, client, require_roles: Callable, public_product: Cal
             if len(term) < 2 and not term.isdigit():
                 return []
             prefix = {"$regex": f"^{re.escape(term)}", "$options": "i"}
+            contains = {"$regex": re.escape(term), "$options": "i"}
             exact = await db.products.find(
                 {"$and": [base, {"$or": [{"barcode": term}, {"sku": term}]}]}, {"_id": 0}
             ).limit(limit).to_list(length=None)
@@ -238,7 +239,13 @@ def build_pos_router(*, db, client, require_roles: Callable, public_product: Cal
                 {"$and": [base, {"$or": [{"name": prefix}, {"sku": prefix}, {"barcode": prefix}, {"manufacturer": prefix}]}]},
                 {"_id": 0},
             ).sort("name", 1).limit(limit).to_list(length=None)
+            prefix_ids = exact_ids | {p["id"] for p in rest}
+            partial = await db.products.find(
+                {"$and": [base, {"$or": [{"name": contains}, {"manufacturer": contains}]}]},
+                {"_id": 0},
+            ).sort("name", 1).limit(limit).to_list(length=None)
             items = exact + [p for p in rest if p["id"] not in exact_ids]
+            items += [p for p in partial if p["id"] not in prefix_ids]
             items = items[:limit]
         out = []
         for p in items:

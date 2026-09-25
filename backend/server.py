@@ -417,9 +417,10 @@ async def list_products(
         if branch_id and user.get("branch_id") and branch_id != user["branch_id"]:
             raise HTTPException(status_code=403, detail="Bu filial mahsulotlarini ko'ra olmaysiz")
         target_branch = branch_id or user.get("branch_id")
-        if not target_branch:
+        if not target_branch and user["role"] == "worker":
             return []
-        query["$and"] = [{"$or": [{"all_branches": True}, {"branch_id": target_branch}, {"branch_id": {"$exists": False}}]}]
+        if target_branch:
+            query["$and"] = [{"$or": [{"all_branches": True}, {"branch_id": target_branch}, {"branch_id": {"$exists": False}}]}]
     elif user and user["role"] == "director" and branch_id:
         query["branch_id"] = branch_id
 

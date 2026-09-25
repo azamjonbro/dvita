@@ -81,6 +81,10 @@ class TestPosBasics:
         p = products[0]
         r = worker.get(f"{BASE_URL}/api/pos/products/search", params={"q": p["name"], "limit": 50})
         assert r.status_code == 200 and any(x["id"] == p["id"] for x in r.json())
+        if len(p["name"]) > 3:
+            middle = p["name"][1:3]
+            r = worker.get(f"{BASE_URL}/api/pos/products/search", params={"q": middle, "limit": 50})
+            assert r.status_code == 200 and any(x["id"] == p["id"] for x in r.json())
         if p.get("barcode"):
             r = worker.get(f"{BASE_URL}/api/pos/products/search", params={"q": p["barcode"]})
             assert r.json()[0]["id"] == p["id"]  # aniq kod mosligi birinchi

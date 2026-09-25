@@ -2,7 +2,13 @@ import uuid
 import requests
 import pytest
 
-from .conftest import BASE_URL, DIRECTOR_EMAIL, DIRECTOR_PASSWORD
+from .conftest import (
+    ADMIN_EMAIL,
+    ADMIN_PASSWORD,
+    BASE_URL,
+    DIRECTOR_EMAIL,
+    DIRECTOR_PASSWORD,
+)
 
 
 def _login(email, password):
@@ -114,3 +120,26 @@ def test_branch_scoping_and_filters():
     director.delete(f"{BASE_URL}/api/users/workers/{worker2_id}", timeout=20)
     director.delete(f"{BASE_URL}/api/branches/{branch1_id}", timeout=20)
     director.delete(f"{BASE_URL}/api/branches/{branch2_id}", timeout=20)
+
+
+def test_branchless_admin_can_list_global_products():
+    director = _login(DIRECTOR_EMAIL, DIRECTOR_PASSWORD)
+    admin = _login(ADMIN_EMAIL, ADMIN_PASSWORD)
+    product = director.post(f"{BASE_URL}/api/products", json={
+        "name": f"Global admin product {uuid.uuid4().hex[:6]}",
+        "description": "visible to global admin",
+        "price": 150000,
+        "image_url": "https://example.com/global.png",
+        "category": "test",
+        "stock": 5,
+        "all_branches": True,
+    }, timeout=20)
+    assert product.status_code == 200, product.text
+    product_id = product.json()["id"]
+
+    try:
+        response = admin.get(f"{BASE_URL}/api/products", timeout=20)
+        assert response.status_code == 200, response.text
+        assert any(item["id"] == product_id for item in response.json())
+    finally:
+        director.delete(f"{BASE_URL}/api/products/{product_id}", timeout=20)
