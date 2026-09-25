@@ -956,6 +956,51 @@ async def all_sales(
     return await db.sales.find(query, {"_id": 0}).sort("created_at", -1).to_list(5000)
 
 
+@api.get("/sales/product-summary")
+async def sales_product_summary(
+    user=Depends(require_roles("director", "admin")),
+    branch_id: Optional[str] = None,
+    worker_id: Optional[str] = None,
+):
+    query = {}
+    if user["role"] == "admin":
+        target_branch = branch_id or user.get("branch_id")
+        if target_branch and target_branch != user.get("branch_id"):
+            raise HTTPException(status_code=403, detail="Bu filial sotuvlarini ko'ra olmaysiz")
+        if target_branch:
+            query["branch_id"] = target_branch
+    elif branch_id:
+        query["branch_id"] = branch_id
+    if worker_id:
+        query["worker_id"] = worker_id
+
+    sold = await db.sales.aggregate([
+        {"$match": query},
+        {"$group": {
+            "_id": "$product_id",
+            "name": {"$first": "$product_name"},
+            "sold_qty": {"$sum": {"$ifNull": ["$quantity", 0]}},
+            "revenue": {"$sum": {"$ifNull": ["$total", 0]}},
+        }},
+    ]).to_list(5000)
+    sold_map = {item["_id"]: item for item in sold}
+    products = await db.products.find({"deleted": {"$ne": True}}, {"_id": 0}).to_list(5000)
+    result = []
+    for product in products:
+        if user["role"] == "admin" and user.get("branch_id"):
+            if not product.get("all_branches") and product.get("branch_id") not in (None, user["branch_id"]):
+                continue
+        item = sold_map.get(product["id"], {})
+        result.append({
+            "product_id": product["id"],
+            "name": product.get("name", ""),
+            "sold_qty": int(item.get("sold_qty", 0) or 0),
+            "revenue": item.get("revenue", 0),
+            "stock": int(product.get("stock", 0) or 0),
+        })
+    return sorted(result, key=lambda item: (-item["sold_qty"], item["name"]))
+
+
 @api.post("/sales/{sid}/follow-up-done")
 async def mark_followup_done(sid: str, user=Depends(require_roles("worker"))):
     res = await db.sales.update_one(
