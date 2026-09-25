@@ -221,7 +221,7 @@ def build_pos_router(*, db, client, require_roles: Callable, public_product: Cal
         base = {"deleted": {"$ne": True}}
         branch_id = user.get("branch_id")
         if branch_id:
-            base["$or"] = [{"all_branches": True}, {"branch_id": branch_id}]
+            base["$or"] = [{"all_branches": True}, {"branch_id": branch_id}, {"branch_id": {"$exists": False}}]
         else:
             return []
         if not term:

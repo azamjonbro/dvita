@@ -112,7 +112,7 @@ class ProductIn(BaseModel):
     barcode: str = ""
     expiry_date: str = ""
     branch_id: Optional[str] = None
-    all_branches: bool = False
+    all_branches: bool = True
     parent_barcode: str = ""  # Eski barkod — variantlar bog'lanishi uchun
     sku: str = ""  # Ichki artikul — POS qidiruvida nom/shtrix-kod bilan birga ishlatiladi
     units_per_package: int = 0  # Qadoqdagi dona/tabletka soni (0 = nomdan avtomatik aniqlanadi)
@@ -379,14 +379,14 @@ async def get_product_by_barcode(code: str, request: Request):
     query = {"barcode": trimmed, "deleted": {"$ne": True}}
     if user and user["role"] in ("admin", "worker"):
         if user.get("branch_id"):
-            query["$or"] = [{"all_branches": True}, {"branch_id": user["branch_id"]}]
+            query["$or"] = [{"all_branches": True}, {"branch_id": user["branch_id"]}, {"branch_id": {"$exists": False}}]
         else:
             return []
     direct = await db.products.find(query, {"_id": 0}).to_list(50)
     variants_query = {"parent_barcode": trimmed, "deleted": {"$ne": True}}
     if user and user["role"] in ("admin", "worker"):
         if user.get("branch_id"):
-            variants_query["$or"] = [{"all_branches": True}, {"branch_id": user["branch_id"]}]
+            variants_query["$or"] = [{"all_branches": True}, {"branch_id": user["branch_id"]}, {"branch_id": {"$exists": False}}]
         else:
             variants_query["branch_id"] = {"$exists": False}
     variants = await db.products.find(variants_query, {"_id": 0}).to_list(50)
@@ -419,7 +419,7 @@ async def list_products(
         target_branch = branch_id or user.get("branch_id")
         if not target_branch:
             return []
-        query["$and"] = [{"$or": [{"all_branches": True}, {"branch_id": target_branch}]}]
+        query["$and"] = [{"$or": [{"all_branches": True}, {"branch_id": target_branch}, {"branch_id": {"$exists": False}}]}]
     elif user and user["role"] == "director" and branch_id:
         query["branch_id"] = branch_id
 
@@ -536,7 +536,7 @@ async def get_product(pid: str, request: Request):
         if target_branch and not p.get("all_branches") and p.get("branch_id") and p["branch_id"] != target_branch:
             raise HTTPException(status_code=403, detail="Bu filial mahsulitlarini ko'ra olmaysiz")
         if target_branch and not p.get("all_branches") and p.get("branch_id") is None:
-            raise HTTPException(status_code=403, detail="Bu mahsulot filialga bog'lanmagan")
+            return public_product(p, hide_cost=hide)
     hide = not (user and user["role"] in ("admin", "director"))
     return public_product(p, hide_cost=hide)
 
