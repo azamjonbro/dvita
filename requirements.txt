@@ -1,0 +1,50 @@
+# ===== FastAPI / ASGI server =====
+fastapi==0.110.1
+uvicorn[standard]==0.25.0
+starlette==0.37.2
+python-multipart==0.0.9
+
+# ===== Pydantic & validation =====
+pydantic>=2.6,<2.8
+email-validator==2.1.1
+annotated-types==0.7.0
+typing_extensions==4.12.2
+
+# ===== Database (MongoDB) =====
+motor==3.3.1
+pymongo==4.5.0
+dnspython==2.6.1
+
+# ===== Auth / Security =====
+bcrypt==4.1.3
+PyJWT==2.8.0
+cryptography==42.0.8
+
+# ===== Environment / Config =====
+python-dotenv==1.0.1
+
+# ===== Email & SMS notifications =====
+resend==2.4.0
+twilio==9.2.3
+
+# ===== PDF / Report generation =====
+reportlab==4.2.2
+pillow==10.4.0
+
+# ===== HTTP clients (twilio / resend internally use these) =====
+requests==2.32.3
+httpx==0.27.0
+httpcore==1.0.5
+certifi==2024.7.4
+charset-normalizer==3.3.2
+idna==3.7
+urllib3==2.2.2
+sniffio==1.3.1
+anyio==4.4.0
+h11==0.14.0
+
+# ===== Utilities =====
+click==8.1.7
+python-dateutil==2.9.0.post0
+six==1.16.0
+PyYAML==6.0.1
