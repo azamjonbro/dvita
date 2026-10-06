@@ -8,6 +8,7 @@ import os
 import re
 import uuid
 import asyncio
+import hashlib
 import logging
 import math
 import bcrypt
@@ -16,7 +17,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone, timedelta
 from typing import List, Optional, Literal
 
-from fastapi import FastAPI, APIRouter, HTTPException, Depends, Request, Response, status
+from fastapi import FastAPI, APIRouter, HTTPException, Depends, Request, Response, status, UploadFile, File, Form
 from fastapi.responses import StreamingResponse
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -25,6 +26,8 @@ from pydantic import BaseModel, Field, EmailStr
 from notifications import notify_director, notify_admin
 from reports import build_csv, build_pdf, _filter_in_month
 from pos import build_pos_router, ensure_pos_indexes, backfill_units_per_package, normalize_phone, product_in_branch
+from stock_import import parse_stock_workbook, StockImportError
+from pymongo import InsertOne, UpdateOne
 
 
 # ---------- Setup ----------
@@ -726,6 +729,153 @@ async def add_stock(pid: str, data: StockAddIn, user=Depends(require_roles("admi
         raise HTTPException(404, "Mahsulot topilmadi")
     p = await db.products.find_one({"id": pid}, {"_id": 0})
     return public_product(p, hide_cost=False)
+
+
+MAX_STOCK_FILE_BYTES = 5 * 1024 * 1024
+DEFAULT_STOCK_IMAGE = "https://images.unsplash.com/photo-1631730486572-226d1f595b68?auto=format&fit=crop&w=900&q=80"
+
+
+@api.post("/products/import-stock")
+async def import_stock(
+    file: UploadFile = File(...),
+    branch_id: str = Form(...),
+    apply: bool = Form(False),
+    mode: Literal["stock", "receive"] = Form("stock"),
+    user=Depends(require_roles("director", "admin")),
+):
+    """Filial tovarlarini Excel (apteka dasturi eksporti) orqali yangilash.
+    mode="stock"   — qoldiqni (astatka) to'g'rilash: faqat mavjud mahsulotlar tahrirlanadi
+                     (qoldiq, narx, muddat); faylda yo'q filial mahsulotlari qoldig'i 0 bo'ladi,
+                     filialda topilmagan qatorlar o'tkazib yuboriladi.
+    mode="receive" — tovar qabul qilish (prixod): mavjud mahsulot soni oshiriladi,
+                     yo'q mahsulot yangi yaratiladi.
+    apply=False — faqat natijani ko'rsatadi (oldindan ko'rish), apply=True — bazaga yozadi."""
+    if not can_manage_all_branches(user) and branch_id != user.get("branch_id"):
+        raise HTTPException(403, "Faqat o'z filialingiz qoldig'ini yuklay olasiz")
+    branch = await db.branches.find_one({"id": branch_id}, {"_id": 0})
+    if not branch:
+        raise HTTPException(400, "Filial topilmadi")
+    data = await file.read(MAX_STOCK_FILE_BYTES + 1)
+    if len(data) > MAX_STOCK_FILE_BYTES:
+        raise HTTPException(400, "Fayl hajmi 5 MB dan oshmasligi kerak")
+    try:
+        rows = await asyncio.to_thread(parse_stock_workbook, data)
+    except StockImportError as exc:
+        raise HTTPException(400, str(exc))
+    file_hash = hashlib.sha256(data).hexdigest()
+    previous = await db.stock_imports.find_one(
+        {"branch_id": branch_id, "mode": mode, "file_hash": file_hash}, {"_id": 0}, sort=[("created_at", -1)]
+    )
+
+    existing = await db.products.find(
+        {"branch_id": branch_id, "all_branches": {"$ne": True}, "deleted": {"$ne": True}}, {"_id": 0}
+    ).to_list(length=None)
+    by_sku = {p["sku"]: p for p in existing if p.get("sku")}
+    by_barcode = {p["barcode"]: p for p in existing if p.get("barcode")}
+
+    now = datetime.now(timezone.utc).isoformat()
+    ops, matched_ids = [], set()
+    summary = {"rows": len(rows), "updated": 0, "unchanged": 0, "created": 0, "zeroed": 0,
+                "increased": 0, "not_found": 0}
+    created_names, zeroed_names, not_found_names = [], [], []
+    for row in rows:
+        product = by_sku.get(row["sku"]) or by_barcode.get(row["barcode"])
+        if product and product["id"] in matched_ids:
+            product = None  # bitta mahsulotga ikki qator tushmasin
+        if product and mode == "receive":
+            matched_ids.add(product["id"])
+            summary["increased"] += 1
+            update = {"price": row["price"], "cost_price": row["cost_price"], "sku": row["sku"],
+                      "manufacturer": row["manufacturer"], "stock_synced_at": now}
+            # Eski partiya hali omborda — eng yaqin muddat saqlanadi
+            if row["expiry_date"] and (not product.get("expiry_date") or row["expiry_date"] < product["expiry_date"]):
+                update["expiry_date"] = row["expiry_date"]
+            ops.append(UpdateOne({"id": product["id"]}, {"$inc": {"stock": row["stock"]}, "$set": update}))
+            continue
+        if not product and mode == "stock":
+            summary["not_found"] += 1
+            not_found_names.append(row["name"])
+            continue
+        if product:
+            matched_ids.add(product["id"])
+            update = {
+                "stock": row["stock"],
+                "price": row["price"],
+                "cost_price": row["cost_price"],
+                "sku": row["sku"],
+                "barcode": row["barcode"],
+                "manufacturer": row["manufacturer"],
+            }
+            if row["expiry_date"]:
+                update["expiry_date"] = row["expiry_date"]
+            if row["units_per_package"]:
+                update["units_per_package"] = row["units_per_package"]
+            if all(str(product.get(k)) == str(v) for k, v in update.items()):
+                summary["unchanged"] += 1
+                continue
+            summary["updated"] += 1
+            ops.append(UpdateOne({"id": product["id"]}, {"$set": {**update, "stock_synced_at": now}}))
+        else:
+            summary["created"] += 1
+            created_names.append(row["name"])
+            ops.append(InsertOne({
+                "id": str(uuid.uuid4()),
+                "name": row["name"],
+                "description": (
+                    f"Ishlab chiqaruvchi: {row['manufacturer'] or '—'}. "
+                    f"O'rashda: {row['units_per_package'] or 1} dona."
+                    + (f" Yaroqlilik muddati: {row['expiry_date']}." if row["expiry_date"] else "")
+                ),
+                "price": row["price"],
+                "cost_price": row["cost_price"],
+                "discount_percent": 0,
+                "image_url": DEFAULT_STOCK_IMAGE,
+                "category": "",
+                "stock": row["stock"],
+                "barcode": row["barcode"],
+                "expiry_date": row["expiry_date"],
+                "sku": row["sku"],
+                "manufacturer": row["manufacturer"],
+                "units_per_package": row["units_per_package"],
+                "parent_barcode": "",
+                "branch_id": branch_id,
+                "all_branches": False,
+                "created_at": now,
+                "stock_synced_at": now,
+            }))
+    for product in existing if mode == "stock" else []:
+        if product["id"] not in matched_ids and int(product.get("stock") or 0) != 0:
+            summary["zeroed"] += 1
+            zeroed_names.append(product.get("name", ""))
+            ops.append(UpdateOne({"id": product["id"]}, {"$set": {"stock": 0, "stock_synced_at": now}}))
+
+    if apply:
+        if ops:
+            await db.products.bulk_write(ops, ordered=False)
+        await db.stock_imports.insert_one({
+            "id": str(uuid.uuid4()),
+            "branch_id": branch_id,
+            "branch_name": branch.get("name"),
+            "file_name": file.filename,
+            "file_hash": file_hash,
+            "mode": mode,
+            "user_id": user["id"],
+            "user_name": user.get("name", ""),
+            "created_at": now,
+            **summary,
+        })
+    return {
+        **summary,
+        "applied": bool(apply),
+        "mode": mode,
+        "already_imported_at": previous.get("created_at") if previous else None,
+        "not_found_sample": not_found_names[:20],
+        "branch_id": branch_id,
+        "branch_name": branch.get("name"),
+        "total_stock": sum(r["stock"] for r in rows),
+        "created_sample": created_names[:20],
+        "zeroed_sample": zeroed_names[:20],
+    }
 
 
 # ---------- News ----------
