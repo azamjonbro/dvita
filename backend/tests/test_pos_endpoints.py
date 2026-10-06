@@ -165,6 +165,10 @@ class TestCompleteSale:
         before = worker.get(f"{BASE_URL}/api/products/{p1['id']}").json()["stock"]
         count_before = len(worker.get(f"{BASE_URL}/api/pos/sales").json())
         base = {"client_request_id": str(uuid.uuid4()), "customer": {"first_name": "A", "phone": _phone()}}
+        # Sotuvchi ID-si o'zgarmas va juda aloqada bo'lmasligi kerak
+        unauthorized = {**base, "employee_id": "not-a-real-worker", "items": [
+            {"product_id": p1["id"], "quantity": 1, "is_medicine": False}]}
+        assert worker.post(f"{BASE_URL}/api/pos/sales", json=unauthorized).status_code == 403
         # dori bo'lsa qabul tartibi majburiy
         r = worker.post(f"{BASE_URL}/api/pos/sales", json={**base, "items": [
             {"product_id": p1["id"], "quantity": 1, "is_medicine": True, "regimen": {"times_per_day": 0, "units_per_intake": 0}}]})

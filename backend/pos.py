@@ -95,13 +95,14 @@ class PosItemIn(BaseModel):
     discount_override: float = 0  # qo'shimcha chegirma, foiz
     is_medicine: bool = True
     regimen: Optional[RegimenIn] = None
-    follow_ups: Optional[List[FollowUpOverride]] = None  # sotuvchi tahrirlagan sanalar
+    follow_ups: Optional[List[FollowUpOverride]] = None
 
 
 class PosSaleIn(BaseModel):
     client_request_id: str = Field(..., min_length=8, max_length=80)
     customer: CustomerRef
     items: List[PosItemIn]
+    employee_id: Optional[str] = None
     discount_amount: float = 0  # umumiy chegirma, so'm
     note: str = ""
 
@@ -370,7 +371,21 @@ def build_pos_router(*, db, client, require_roles: Callable, public_product: Cal
         if dup:
             return {**(await sale_bundle(dup)), "duplicate": True}
 
-        # 2) Majburiy maydonlar
+        # 2) Sotuvchi tanlanishi — klient tomonidan yuborilgan ID faqat
+        # autentikatsiylagan rol va filial bo'yicha ega ishchi uchun qabul qilinadi.
+        employee_id = data.employee_id or user["id"]
+        employee = await db.users.find_one(
+            {"id": employee_id, "role": "worker"}, {"_id": 0}
+        )
+        if not employee:
+            raise HTTPException(403, "Tanlangan sotuvchi topilmadi yoki ishchi emas")
+        if user["role"] == "worker" and employee_id != user["id"]:
+            raise HTTPException(403, "Sotuvchi sizning olingiz emas")
+        if user.get("branch_id") and employee.get("branch_id") != user["branch_id"]:
+            raise HTTPException(403, "Tanlangan sotuvchi sizning filialingizdan tashqarida")
+        worker_name = _worker_name(employee)
+
+        # 3) Majburiy maydonlar
         if not data.items:
             raise HTTPException(400, "Kamida bitta mahsulot tanlang")
         if not data.customer.id and not data.customer.first_name.strip():
@@ -453,7 +468,6 @@ def build_pos_router(*, db, client, require_roles: Callable, public_product: Cal
         total = money(subtotal - extra_discount)
 
         sale_id = str(uuid.uuid4())
-        worker_name = _worker_name(user)
 
         # 4) Atomik yozish: tranzaksiya (replica set) yoki kompensatsiyali fallback
         undo_stock: List[tuple] = []  # fallback rejimida qoldiqni qaytarish uchun
@@ -473,7 +487,7 @@ def build_pos_router(*, db, client, require_roles: Callable, public_product: Cal
                 "daily_number": daily_number,
                 "sale_date": today.isoformat(),
                 "sale_date_time": now_utc.isoformat(),
-                "employee_id": user["id"],
+                "employee_id": employee_id,
                 "employee_name": worker_name,
                 "customer_id": customer["id"],
                 "customer_name": f"{customer.get('first_name','')} {customer.get('last_name','')}".strip(),
@@ -543,7 +557,7 @@ def build_pos_router(*, db, client, require_roles: Callable, public_product: Cal
                         "recommendation": _regimen_text(reg),
                         "sale_date": today.isoformat(),
                         "estimated_end_date": reg.get("estimated_end_date"),
-                        "assigned_employee_id": user["id"],
+                        "assigned_employee_id": employee_id,
                         "assigned_employee_name": worker_name,
                         "follow_up_number": f["follow_up_number"],
                         "stage_key": f["stage_key"],
@@ -567,7 +581,7 @@ def build_pos_router(*, db, client, require_roles: Callable, public_product: Cal
                     "pos_sale_id": sale_id,
                     "sale_code": sale_code,
                     "daily_number": daily_number,
-                    "worker_id": user["id"],
+                    "worker_id": employee_id,
                     "worker_name": worker_name,
                     "customer_id": customer["id"],
                     "customer_name": customer.get("first_name", ""),
