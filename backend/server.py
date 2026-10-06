@@ -101,6 +101,7 @@ class CreateWorker(BaseModel):
     surname: str = ""
     phone: str = ""
     branch_id: Optional[str] = None
+    all_branches: bool = False  # barcha filiallarda sotuvchi sifatida tanlanadi
 
 
 class UpdateWorker(BaseModel):
@@ -110,6 +111,7 @@ class UpdateWorker(BaseModel):
     email: Optional[EmailStr] = None
     password: Optional[str] = None  # bo'sh — parol o'zgarmaydi
     branch_id: Optional[str] = None
+    all_branches: bool = False
 
 
 class ProductIn(BaseModel):
@@ -201,6 +203,7 @@ def serialize_user(u: dict) -> dict:
         "role": u["role"],
         "branch_id": u.get("branch_id"),
         "branch_name": u.get("branch_name"),
+        "all_branches": bool(u.get("all_branches")),
         "created_at": u.get("created_at", datetime.now(timezone.utc).isoformat()),
     }
     return out
@@ -1402,10 +1405,9 @@ async def list_users(user=Depends(require_roles("director", "admin"))):
 @api.get("/users/workers")
 async def list_workers(user=Depends(require_roles("director", "worker", "admin"))):
     query = {"role": "worker"}
-    if user["role"] == "worker" and user.get("branch_id"):
-        query["branch_id"] = user["branch_id"]
-    elif user["role"] == "admin" and user.get("branch_id"):
-        query["branch_id"] = user["branch_id"]
+    if user["role"] in ("worker", "admin") and user.get("branch_id"):
+        # O'z filiali xodimlari + barcha filiallarda ishlaydigan xodimlar
+        query["$or"] = [{"branch_id": user["branch_id"]}, {"all_branches": True}]
     return await db.users.find(query, {"_id": 0, "password_hash": 0}).to_list(100)
 
 
@@ -1440,6 +1442,8 @@ async def create_worker(data: CreateWorker, user=Depends(require_roles("director
         "role": "worker",
         "branch_id": branch_id,
         "branch_name": branch_name,
+        # Filial admini xodimni boshqa filiallarga ochib bera olmaydi
+        "all_branches": bool(data.all_branches) and not (user["role"] == "admin" and user.get("branch_id")),
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
     await db.users.insert_one(w)
@@ -1470,6 +1474,8 @@ async def update_worker(wid: str, data: UpdateWorker, user=Depends(require_roles
         "phone": data.phone.strip(),
         "branch_id": branch_id,
         "branch_name": branch.get("name"),
+        # Filial admini xodimni boshqa filiallarga ochib bera olmaydi
+        "all_branches": bool(data.all_branches) if not my_branch else bool(target.get("all_branches")),
     }
     if data.email and data.email.lower() != target["email"]:
         email = data.email.lower()

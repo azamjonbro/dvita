@@ -397,9 +397,12 @@ def build_pos_router(*, db, client, require_roles: Callable, public_product: Cal
         # sotuvchini tanlay oladi (filial tekshiruvi pastda)
         if user["role"] == "worker" and employee_id != user["id"] and not user.get("branch_id"):
             raise HTTPException(403, "Filialsiz ishchi boshqa sotuvchini tanlay olmaydi")
-        if user.get("branch_id") and employee.get("branch_id") != user["branch_id"]:
+        if (user.get("branch_id") and employee.get("branch_id") != user["branch_id"]
+                and not employee.get("all_branches")):
             raise HTTPException(403, "Tanlangan sotuvchi sizning filialingizdan tashqarida")
         worker_name = _worker_name(employee)
+        # Sotuv kassa filialiga yoziladi; "barcha filiallar" xodimi istalgan filialda sota oladi
+        sale_branch_id = user.get("branch_id") or employee.get("branch_id")
 
         # 3) Majburiy maydonlar
         if not data.items:
@@ -424,7 +427,7 @@ def build_pos_router(*, db, client, require_roles: Callable, public_product: Cal
             product = await db.products.find_one({"id": it.product_id, "deleted": {"$ne": True}}, {"_id": 0})
             if not product:
                 raise HTTPException(404, f"{idx}-qator: mahsulot topilmadi")
-            if not product_in_branch(product, employee.get("branch_id")):
+            if not product_in_branch(product, sale_branch_id):
                 raise HTTPException(403, f"{product['name']} — sotuvchi filialiga tegishli emas")
             stock = int(product.get("stock", 0) or 0)
             if it.quantity > stock:
@@ -508,6 +511,7 @@ def build_pos_router(*, db, client, require_roles: Callable, public_product: Cal
                 "sale_date_time": now_utc.isoformat(),
                 "employee_id": employee_id,
                 "employee_name": worker_name,
+                "branch_id": sale_branch_id,
                 "customer_id": customer["id"],
                 "customer_name": f"{customer.get('first_name','')} {customer.get('last_name','')}".strip(),
                 "customer_phone": customer.get("phone", ""),

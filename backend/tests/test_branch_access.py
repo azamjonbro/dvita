@@ -335,10 +335,12 @@ def test_worker_can_pick_seller_from_own_branch_only():
     b2 = director.post(f"{BASE_URL}/api/branches", json={"name": f"Seller B {uuid.uuid4().hex[:4]}",
                                                           "code": f"SB-{uuid.uuid4().hex[:4]}"}, timeout=20).json()["id"]
     ids, emails = [], []
-    for branch_id in (b1, b1, b2):
+    # 0,1 — b1 xodimlari; 2 — b2 xodimi; 3 — asosiy filiali b2, lekin barcha filiallarda ishlaydi
+    for branch_id, everywhere in ((b1, False), (b1, False), (b2, False), (b2, True)):
         email = f"test_seller_{uuid.uuid4().hex[:8]}@vita.com"
         r = director.post(f"{BASE_URL}/api/users/workers", json={
-            "email": email, "password": "Branch1234", "name": "Seller", "branch_id": branch_id}, timeout=20)
+            "email": email, "password": "Branch1234", "name": "Seller", "branch_id": branch_id,
+            "all_branches": everywhere}, timeout=20)
         assert r.status_code == 200, r.text
         ids.append(r.json()["id"])
         emails.append(email)
@@ -357,11 +359,18 @@ def test_worker_can_pick_seller_from_own_branch_only():
 
     try:
         colleagues = {w["id"] for w in cashier.get(f"{BASE_URL}/api/users/workers", timeout=20).json()}
-        assert colleagues == {ids[0], ids[1]}  # faqat o'z filiali sotuvchilari
+        assert colleagues == {ids[0], ids[1], ids[3]}  # o'z filiali + barcha filiallar xodimi
         ok = sell(ids[1])
         assert ok.status_code == 200, ok.text
         assert ok.json()["sale"]["employee_id"] == ids[1]
         assert sell(ids[2]).status_code == 403  # boshqa filial sotuvchisi
+        everywhere = sell(ids[3])
+        assert everywhere.status_code == 200, everywhere.text
+        assert everywhere.json()["sale"]["branch_id"] == b1  # sotuv kassa filialiga yoziladi
+        # Tahrirlashda belgi olib tashlansa — b1 kassasida endi tanlanmaydi
+        director.put(f"{BASE_URL}/api/users/workers/{ids[3]}", json={
+            "name": "Seller", "branch_id": b2, "all_branches": False}, timeout=20)
+        assert sell(ids[3]).status_code == 403
     finally:
         director.delete(f"{BASE_URL}/api/products/{product['id']}", timeout=20)
         for wid in ids:
