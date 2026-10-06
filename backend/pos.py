@@ -388,8 +388,10 @@ def build_pos_router(*, db, client, require_roles: Callable, public_product: Cal
         )
         if not employee:
             raise HTTPException(403, "Tanlangan sotuvchi topilmadi yoki ishchi emas")
-        if user["role"] == "worker" and employee_id != user["id"]:
-            raise HTTPException(403, "Sotuvchi sizning olingiz emas")
+        # Bitta kassada bir necha sotuvchi ishlaydi — ishchi o'z filialidagi
+        # sotuvchini tanlay oladi (filial tekshiruvi pastda)
+        if user["role"] == "worker" and employee_id != user["id"] and not user.get("branch_id"):
+            raise HTTPException(403, "Filialsiz ishchi boshqa sotuvchini tanlay olmaydi")
         if user.get("branch_id") and employee.get("branch_id") != user["branch_id"]:
             raise HTTPException(403, "Tanlangan sotuvchi sizning filialingizdan tashqarida")
         worker_name = _worker_name(employee)

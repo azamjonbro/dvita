@@ -326,3 +326,45 @@ def test_branchless_admin_can_list_global_products():
     finally:
         director.delete(f"{BASE_URL}/api/products/{product_id}", timeout=20)
         director.delete(f"{BASE_URL}/api/branches/{branch_id}", timeout=20)
+
+
+def test_worker_can_pick_seller_from_own_branch_only():
+    director = _login(DIRECTOR_EMAIL, DIRECTOR_PASSWORD)
+    b1 = director.post(f"{BASE_URL}/api/branches", json={"name": f"Seller A {uuid.uuid4().hex[:4]}",
+                                                          "code": f"SA-{uuid.uuid4().hex[:4]}"}, timeout=20).json()["id"]
+    b2 = director.post(f"{BASE_URL}/api/branches", json={"name": f"Seller B {uuid.uuid4().hex[:4]}",
+                                                          "code": f"SB-{uuid.uuid4().hex[:4]}"}, timeout=20).json()["id"]
+    ids, emails = [], []
+    for branch_id in (b1, b1, b2):
+        email = f"test_seller_{uuid.uuid4().hex[:8]}@vita.com"
+        r = director.post(f"{BASE_URL}/api/users/workers", json={
+            "email": email, "password": "Branch1234", "name": "Seller", "branch_id": branch_id}, timeout=20)
+        assert r.status_code == 200, r.text
+        ids.append(r.json()["id"])
+        emails.append(email)
+    product = director.post(f"{BASE_URL}/api/products", json={
+        "name": f"Seller product {uuid.uuid4().hex[:4]}", "description": "d", "price": 1000,
+        "image_url": "https://example.com/1.png", "stock": 5, "branch_id": b1}, timeout=20).json()
+    cashier = _login(emails[0], "Branch1234")
+
+    def sell(employee_id):
+        return cashier.post(f"{BASE_URL}/api/pos/sales", json={
+            "client_request_id": str(uuid.uuid4()),
+            "employee_id": employee_id,
+            "customer": {"first_name": "Mijoz", "phone": "+998 90 " + str(uuid.uuid4().int)[:7]},
+            "items": [{"product_id": product["id"], "quantity": 1, "is_medicine": False}],
+        }, timeout=20)
+
+    try:
+        colleagues = {w["id"] for w in cashier.get(f"{BASE_URL}/api/users/workers", timeout=20).json()}
+        assert colleagues == {ids[0], ids[1]}  # faqat o'z filiali sotuvchilari
+        ok = sell(ids[1])
+        assert ok.status_code == 200, ok.text
+        assert ok.json()["sale"]["employee_id"] == ids[1]
+        assert sell(ids[2]).status_code == 403  # boshqa filial sotuvchisi
+    finally:
+        director.delete(f"{BASE_URL}/api/products/{product['id']}", timeout=20)
+        for wid in ids:
+            director.delete(f"{BASE_URL}/api/users/workers/{wid}", timeout=20)
+        director.delete(f"{BASE_URL}/api/branches/{b1}", timeout=20)
+        director.delete(f"{BASE_URL}/api/branches/{b2}", timeout=20)
