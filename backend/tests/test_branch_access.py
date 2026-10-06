@@ -122,9 +122,190 @@ def test_branch_scoping_and_filters():
     director.delete(f"{BASE_URL}/api/branches/{branch2_id}", timeout=20)
 
 
+def test_worker_product_operations_are_restricted_to_assigned_branch():
+    director = _login(DIRECTOR_EMAIL, DIRECTOR_PASSWORD)
+    branch1 = director.post(f"{BASE_URL}/api/branches", json={
+        "name": f"Worker Product Branch {uuid.uuid4().hex[:4]}",
+        "code": f"WP-{uuid.uuid4().hex[:4]}",
+        "address": "Tashkent",
+    }, timeout=20)
+    assert branch1.status_code == 200, branch1.text
+    branch1_id = branch1.json()["id"]
+
+    branch2 = director.post(f"{BASE_URL}/api/branches", json={
+        "name": f"Other Product Branch {uuid.uuid4().hex[:4]}",
+        "code": f"OP-{uuid.uuid4().hex[:4]}",
+        "address": "Samarkand",
+    }, timeout=20)
+    assert branch2.status_code == 200, branch2.text
+    branch2_id = branch2.json()["id"]
+
+    worker_email = f"test_product_worker_{uuid.uuid4().hex[:8]}@vita.com"
+    worker = director.post(f"{BASE_URL}/api/users/workers", json={
+        "email": worker_email,
+        "password": "Branch1234",
+        "name": "Product",
+        "surname": "Worker",
+        "phone": "+998900000001",
+        "branch_id": branch1_id,
+    }, timeout=20)
+    assert worker.status_code == 200, worker.text
+    worker_session = _login(worker_email, "Branch1234")
+
+    product1 = director.post(f"{BASE_URL}/api/products", json={
+        "name": f"Worker product one {uuid.uuid4().hex[:4]}",
+        "description": "branch one",
+        "price": 150000,
+        "cost_price": 100000,
+        "image_url": "https://example.com/1.png",
+        "category": "test",
+        "stock": 10,
+        "branch_id": branch1_id,
+    }, timeout=20)
+    assert product1.status_code == 200, product1.text
+    product1_id = product1.json()["id"]
+
+    product2 = director.post(f"{BASE_URL}/api/products", json={
+        "name": f"Worker product two {uuid.uuid4().hex[:4]}",
+        "description": "branch two",
+        "price": 170000,
+        "cost_price": 110000,
+        "image_url": "https://example.com/2.png",
+        "category": "test",
+        "stock": 7,
+        "branch_id": branch2_id,
+    }, timeout=20)
+    assert product2.status_code == 200, product2.text
+    product2_id = product2.json()["id"]
+
+    try:
+        listed = worker_session.get(f"{BASE_URL}/api/products", timeout=20)
+        assert listed.status_code == 200, listed.text
+        listed_ids = {item["id"] for item in listed.json()}
+        assert product1_id in listed_ids
+        assert product2_id not in listed_ids
+
+        assert worker_session.get(f"{BASE_URL}/api/products/{product1_id}", timeout=20).status_code == 200
+        assert worker_session.get(f"{BASE_URL}/api/products/{product2_id}", timeout=20).status_code == 403
+
+        # Xodim filial yubormasa ham mahsulot uning filialiga biriktiriladi
+        own_branch = worker_session.post(f"{BASE_URL}/api/products", json={
+            "name": f"Own branch {uuid.uuid4().hex[:4]}",
+            "description": "auto branch",
+            "price": 100,
+            "image_url": "https://example.com/1.png",
+            "category": "test",
+            "stock": 1,
+        }, timeout=20)
+        assert own_branch.status_code == 200, own_branch.text
+        assert own_branch.json()["branch_id"] == branch1_id
+        assert own_branch.json()["all_branches"] is False
+        director.delete(f"{BASE_URL}/api/products/{own_branch.json()['id']}", timeout=20)
+
+        # Director filialsiz mahsulot yarata olmaydi
+        missing_branch = director.post(f"{BASE_URL}/api/products", json={
+            "name": f"Missing branch {uuid.uuid4().hex[:4]}",
+            "description": "requires branch",
+            "price": 100,
+            "image_url": "https://example.com/1.png",
+            "category": "test",
+            "stock": 1,
+        }, timeout=20)
+        assert missing_branch.status_code == 400
+        assert "Filialni tanlang" in missing_branch.text
+
+        # Bir xil shtrix-kodli tovar har filialga alohida kiritiladi, bitta filialda esa takrorlanmaydi
+        code = f"BR{uuid.uuid4().hex[:8]}"
+        same_a = director.post(f"{BASE_URL}/api/products", json={
+            "name": "Paratsetamol", "description": "a", "price": 100, "image_url": "https://e.com/a.png",
+            "stock": 1, "barcode": code, "branch_id": branch1_id}, timeout=20)
+        same_b = director.post(f"{BASE_URL}/api/products", json={
+            "name": "Paratsetamol", "description": "b", "price": 100, "image_url": "https://e.com/a.png",
+            "stock": 1, "barcode": code, "branch_id": branch2_id}, timeout=20)
+        dup_a = director.post(f"{BASE_URL}/api/products", json={
+            "name": "Paratsetamol", "description": "c", "price": 100, "image_url": "https://e.com/a.png",
+            "stock": 1, "barcode": code, "branch_id": branch1_id}, timeout=20)
+        assert same_a.status_code == 200, same_a.text
+        assert same_b.status_code == 200, same_b.text
+        assert dup_a.status_code == 400
+        director.delete(f"{BASE_URL}/api/products/{same_a.json()['id']}", timeout=20)
+        director.delete(f"{BASE_URL}/api/products/{same_b.json()['id']}", timeout=20)
+
+        unknown_branch = director.post(f"{BASE_URL}/api/products", json={
+            "name": f"Unknown branch {uuid.uuid4().hex[:4]}",
+            "description": "requires existing branch",
+            "price": 100,
+            "image_url": "https://example.com/1.png",
+            "category": "test",
+            "stock": 1,
+            "branch_id": "no-such-branch",
+        }, timeout=20)
+        assert unknown_branch.status_code == 400
+
+        other_branch = worker_session.post(f"{BASE_URL}/api/products", json={
+            "name": f"Other branch product {uuid.uuid4().hex[:4]}",
+            "description": "blocked",
+            "price": 100,
+            "image_url": "https://example.com/1.png",
+            "category": "test",
+            "stock": 1,
+            "branch_id": branch2_id,
+        }, timeout=20)
+        assert other_branch.status_code == 403
+
+        assert worker_session.put(f"{BASE_URL}/api/products/{product2_id}", json={
+            "name": product2.json()["name"],
+            "description": product2.json()["description"],
+            "price": 170000,
+            "cost_price": 110000,
+            "image_url": product2.json()["image_url"],
+            "category": product2.json()["category"],
+            "stock": 7,
+            "branch_id": branch2_id,
+        }, timeout=20).status_code == 403
+        assert worker_session.delete(f"{BASE_URL}/api/products/{product2_id}", timeout=20).status_code == 403
+
+        # Ishchini boshqa filialga o'tkazish — mahsulotlar ro'yxati darhol yangi filial bo'yicha
+        moved = director.put(f"{BASE_URL}/api/users/workers/{worker.json()['id']}", json={
+            "name": "Product", "surname": "Worker", "phone": "+998900000001", "branch_id": branch2_id,
+        }, timeout=20)
+        assert moved.status_code == 200, moved.text
+        assert moved.json()["branch_id"] == branch2_id
+        moved_ids = {item["id"] for item in worker_session.get(f"{BASE_URL}/api/products", timeout=20).json()}
+        assert product2_id in moved_ids and product1_id not in moved_ids
+        director.put(f"{BASE_URL}/api/users/workers/{worker.json()['id']}", json={
+            "name": "Product", "surname": "Worker", "phone": "+998900000001", "branch_id": branch1_id,
+        }, timeout=20)
+        assert director.put(f"{BASE_URL}/api/users/workers/{worker.json()['id']}", json={
+            "name": "Product", "branch_id": "",
+        }, timeout=20).status_code == 400
+
+        # Boshqa filial mahsulotini POS orqali sotib bo'lmaydi (ombor o'zgarmaydi)
+        pos_sale = worker_session.post(f"{BASE_URL}/api/pos/sales", json={
+            "client_request_id": str(uuid.uuid4()),
+            "customer": {"first_name": "Filial", "phone": "+998 90 " + str(uuid.uuid4().int)[:7]},
+            "items": [{"product_id": product2_id, "quantity": 1, "is_medicine": False}],
+        }, timeout=20)
+        assert pos_sale.status_code == 403, pos_sale.text
+        assert director.get(f"{BASE_URL}/api/products/{product2_id}", timeout=20).json()["stock"] == 7
+    finally:
+        director.delete(f"{BASE_URL}/api/products/{product1_id}", timeout=20)
+        director.delete(f"{BASE_URL}/api/products/{product2_id}", timeout=20)
+        director.delete(f"{BASE_URL}/api/users/workers/{worker.json()['id']}", timeout=20)
+        director.delete(f"{BASE_URL}/api/branches/{branch1_id}", timeout=20)
+        director.delete(f"{BASE_URL}/api/branches/{branch2_id}", timeout=20)
+
+
 def test_branchless_admin_can_list_global_products():
     director = _login(DIRECTOR_EMAIL, DIRECTOR_PASSWORD)
     admin = _login(ADMIN_EMAIL, ADMIN_PASSWORD)
+    branch = director.post(f"{BASE_URL}/api/branches", json={
+        "name": f"Global Branch {uuid.uuid4().hex[:4]}",
+        "code": f"GB-{uuid.uuid4().hex[:4]}",
+        "address": "Tashkent",
+    }, timeout=20)
+    assert branch.status_code == 200, branch.text
+    branch_id = branch.json()["id"]
     product = director.post(f"{BASE_URL}/api/products", json={
         "name": f"Global admin product {uuid.uuid4().hex[:6]}",
         "description": "visible to global admin",
@@ -133,6 +314,7 @@ def test_branchless_admin_can_list_global_products():
         "category": "test",
         "stock": 5,
         "all_branches": True,
+        "branch_id": branch_id,
     }, timeout=20)
     assert product.status_code == 200, product.text
     product_id = product.json()["id"]
@@ -143,3 +325,4 @@ def test_branchless_admin_can_list_global_products():
         assert any(item["id"] == product_id for item in response.json())
     finally:
         director.delete(f"{BASE_URL}/api/products/{product_id}", timeout=20)
+        director.delete(f"{BASE_URL}/api/branches/{branch_id}", timeout=20)

@@ -14,7 +14,7 @@ def _make_session():
 
 
 @pytest.fixture(scope="module")
-def worker_ctx(director_client):
+def worker_ctx(director_client, test_branch_id):
     """Create (or recycle) a dedicated worker for this module's sale tests."""
     # cleanup any TEST_ workers first
     workers = director_client.get(f"{BASE_URL}/api/users/workers").json()
@@ -29,7 +29,8 @@ def worker_ctx(director_client):
     wmail = f"TEST_newep_{uuid.uuid4().hex[:6]}@x.com"
     wpw = "Work1234"
     r = director_client.post(f"{BASE_URL}/api/users/workers", json={
-        "email": wmail, "password": wpw, "name": "Newep", "surname": "Wkr", "phone": "+9"
+        "email": wmail, "password": wpw, "name": "Newep", "surname": "Wkr", "phone": "+9",
+        "branch_id": test_branch_id,
     })
     assert r.status_code == 200, r.text
     wid = r.json()["id"]
@@ -96,7 +97,7 @@ class TestProductSearch:
         assert r.status_code == 200
         assert r.json() == []
 
-    def test_pagination_and_filters_work(self, admin_client):
+    def test_pagination_and_filters_work(self, admin_client, test_branch_id):
         created = []
         for idx, (name, price, stock) in enumerate([
             (f"TEST_PAG_1_{uuid.uuid4().hex[:6]}", 150, 0),
@@ -110,7 +111,7 @@ class TestProductSearch:
                 "price": price,
                 "image_url": "https://x",
                 "category": "test",
-                "stock": stock,
+                "branch_id": test_branch_id, "stock": stock,
                 "barcode": f"TESTPAG_{uuid.uuid4().hex[:8]}",
             }
             r = admin_client.post(f"{BASE_URL}/api/products", json=payload)
@@ -147,11 +148,11 @@ class TestProductSearch:
 
 # ---------- Soft delete + restore + deleted list ----------
 class TestSoftDeleteRestore:
-    def test_soft_delete_then_restore(self, admin_client):
+    def test_soft_delete_then_restore(self, admin_client, test_branch_id):
         # create
         payload = {"name": f"TEST_softdel_{uuid.uuid4().hex[:6]}", "description": "d",
                    "price": 1000, "image_url": "https://x", "category": "test",
-                   "stock": 5, "barcode": "TESTSOFT_" + uuid.uuid4().hex[:8]}
+                   "branch_id": test_branch_id, "stock": 5, "barcode": "TESTSOFT_" + uuid.uuid4().hex[:8]}
         cr = admin_client.post(f"{BASE_URL}/api/products", json=payload)
         assert cr.status_code == 200, cr.text
         pid = cr.json()["id"]
@@ -187,10 +188,10 @@ class TestSoftDeleteRestore:
 
 # ---------- Stock-add ----------
 class TestStockAdd:
-    def test_stock_add_increments(self, admin_client):
+    def test_stock_add_increments(self, admin_client, test_branch_id):
         payload = {"name": f"TEST_stockadd_{uuid.uuid4().hex[:6]}", "description": "d",
                    "price": 100, "image_url": "https://x", "category": "test",
-                   "stock": 10, "barcode": "TESTSTK_" + uuid.uuid4().hex[:8]}
+                   "branch_id": test_branch_id, "stock": 10, "barcode": "TESTSTK_" + uuid.uuid4().hex[:8]}
         cr = admin_client.post(f"{BASE_URL}/api/products", json=payload)
         assert cr.status_code == 200
         pid = cr.json()["id"]
@@ -208,11 +209,11 @@ class TestStockAdd:
 
 # ---------- Single sale: stock decrement + low-stock notification ----------
 class TestSaleStockAndLowStock:
-    def test_single_sale_decrements_and_notifies(self, admin_client, director_client, worker_ctx):
+    def test_single_sale_decrements_and_notifies(self, admin_client, director_client, worker_ctx, test_branch_id):
         # create a product with stock=6 so 2x sale of 1 drops <=5 -> notif
         payload = {"name": f"TEST_lowstock_{uuid.uuid4().hex[:6]}", "description": "d",
                    "price": 1000, "cost_price": 500, "image_url": "https://x",
-                   "category": "test", "stock": 6,
+                   "category": "test", "branch_id": test_branch_id, "stock": 6,
                    "barcode": "TESTLOW_" + uuid.uuid4().hex[:8]}
         cr = admin_client.post(f"{BASE_URL}/api/products", json=payload)
         assert cr.status_code == 200, cr.text
@@ -248,14 +249,14 @@ class TestSaleStockAndLowStock:
 
 # ---------- Multi-product cart sale ----------
 class TestMultiSale:
-    def test_multi_sale_receipt_and_decrement(self, admin_client, worker_ctx):
+    def test_multi_sale_receipt_and_decrement(self, admin_client, worker_ctx, test_branch_id):
         # two products
         ids = []
         for i in range(2):
             cr = admin_client.post(f"{BASE_URL}/api/products", json={
                 "name": f"TEST_multi_{i}_{uuid.uuid4().hex[:6]}", "description": "d",
                 "price": 10000, "cost_price": 5000, "image_url": "https://x",
-                "category": "test", "stock": 20,
+                "category": "test", "branch_id": test_branch_id, "stock": 20,
                 "barcode": f"TESTMUL{i}_" + uuid.uuid4().hex[:6]})
             assert cr.status_code == 200, cr.text
             ids.append(cr.json()["id"])
@@ -310,12 +311,12 @@ class TestMultiSale:
 
 # ---------- Best sellers ----------
 class TestBestSellers:
-    def test_best_sellers_public_list(self, api_client, admin_client, worker_ctx):
+    def test_best_sellers_public_list(self, api_client, admin_client, worker_ctx, test_branch_id):
         # ensure at least one sale exists so endpoint isn't trivially empty
         pcr = admin_client.post(f"{BASE_URL}/api/products", json={
             "name": f"TEST_best_{uuid.uuid4().hex[:6]}", "description": "d",
             "price": 100, "cost_price": 50, "image_url": "https://x",
-            "category": "test", "stock": 100,
+            "category": "test", "branch_id": test_branch_id, "stock": 100,
             "barcode": "TESTBEST_" + uuid.uuid4().hex[:8]})
         assert pcr.status_code == 200
         pid = pcr.json()["id"]
@@ -338,12 +339,12 @@ class TestBestSellers:
         # cleanup
         admin_client.delete(f"{BASE_URL}/api/products/{pid}")
 
-    def test_best_sellers_excludes_deleted(self, api_client, admin_client, worker_ctx):
+    def test_best_sellers_excludes_deleted(self, api_client, admin_client, worker_ctx, test_branch_id):
         # product, sell it once, soft-delete, ensure it is NOT in best-sellers
         pcr = admin_client.post(f"{BASE_URL}/api/products", json={
             "name": f"TEST_bestdel_{uuid.uuid4().hex[:6]}", "description": "d",
             "price": 100, "cost_price": 50, "image_url": "https://x",
-            "category": "test", "stock": 100,
+            "category": "test", "branch_id": test_branch_id, "stock": 100,
             "barcode": "TESTBDEL_" + uuid.uuid4().hex[:8]})
         pid = pcr.json()["id"]
         w = worker_ctx["session"]

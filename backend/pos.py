@@ -46,6 +46,15 @@ from pos_logic import (
     units_from_product,
 )
 
+
+def product_in_branch(product: dict, branch_id: Optional[str]) -> bool:
+    """Mahsulot shu filialda sotilishi mumkinmi (qidiruvdagi filtr bilan bir xil):
+    umumiy, filialga hali biriktirilmagan eski yoki shu filial mahsuloti."""
+    if product.get("all_branches") or "branch_id" not in product:
+        return True
+    return bool(branch_id) and product.get("branch_id") == branch_id
+
+
 logger = logging.getLogger("pos")
 
 STAFF = ("worker", "director", "admin")
@@ -408,6 +417,8 @@ def build_pos_router(*, db, client, require_roles: Callable, public_product: Cal
             product = await db.products.find_one({"id": it.product_id, "deleted": {"$ne": True}}, {"_id": 0})
             if not product:
                 raise HTTPException(404, f"{idx}-qator: mahsulot topilmadi")
+            if not product_in_branch(product, employee.get("branch_id")):
+                raise HTTPException(403, f"{product['name']} — sotuvchi filialiga tegishli emas")
             stock = int(product.get("stock", 0) or 0)
             if it.quantity > stock:
                 raise HTTPException(400, f"{product['name']} — omborda atigi {stock} ta bor")

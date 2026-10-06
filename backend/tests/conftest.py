@@ -49,3 +49,17 @@ def director_client():
 def admin_client():
     s, token, user = _login_client(ADMIN_EMAIL, ADMIN_PASSWORD)
     return s
+
+
+@pytest.fixture(scope="session")
+def test_branch_id(director_client):
+    """Mahsulotlar filialga biriktirilishi majburiy — testlar uchun umumiy filial."""
+    import uuid
+    r = director_client.post(f"{BASE_URL}/api/branches", json={
+        "name": f"TEST filial {uuid.uuid4().hex[:4]}",
+        "code": f"TEST-{uuid.uuid4().hex[:6]}",
+    })
+    assert r.status_code == 200, r.text
+    bid = r.json()["id"]
+    yield bid
+    director_client.delete(f"{BASE_URL}/api/branches/{bid}")

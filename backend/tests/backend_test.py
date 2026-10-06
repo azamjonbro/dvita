@@ -112,9 +112,10 @@ class TestProducts:
         assert r.status_code == 200
         assert r.json()["id"] == pid
 
-    def test_admin_crud_product(self, admin_client):
+    def test_admin_crud_product(self, admin_client, test_branch_id):
         payload = {"name": "TEST_Prod", "description": "d", "price": 1000,
-                   "image_url": "https://x", "category": "test", "stock": 5}
+                   "image_url": "https://x", "category": "test", "stock": 5,
+                   "branch_id": test_branch_id}
         r = admin_client.post(f"{BASE_URL}/api/products", json=payload)
         assert r.status_code == 200, r.text
         pid = r.json()["id"]
@@ -144,8 +145,15 @@ class TestProducts:
         lr = s.post(f"{BASE_URL}/api/auth/login", json={"email": wmail, "password": "Work1234"})
         assert lr.status_code == 200
         s.headers.update({"Authorization": f"Bearer {lr.json()['token']}"})
+        me = s.get(f"{BASE_URL}/api/auth/me").json()
         r = s.post(f"{BASE_URL}/api/products", json={"name": "x", "description": "y", "price": 1, "image_url": "u"})
-        assert r.status_code == 403
+        # Xodim faqat o'z filialiga mahsulot qo'sha oladi; filialsiz xodim — umuman qo'sha olmaydi
+        if me.get("branch_id"):
+            assert r.status_code == 200, r.text
+            assert r.json()["branch_id"] == me["branch_id"]
+            director_client.delete(f"{BASE_URL}/api/products/{r.json()['id']}")
+        else:
+            assert r.status_code == 400
         # cleanup
         director_client.delete(f"{BASE_URL}/api/users/workers/{wid}")
 

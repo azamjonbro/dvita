@@ -24,7 +24,7 @@ from pydantic import BaseModel, Field, EmailStr
 
 from notifications import notify_director, notify_admin
 from reports import build_csv, build_pdf, _filter_in_month
-from pos import build_pos_router, ensure_pos_indexes, backfill_units_per_package, normalize_phone
+from pos import build_pos_router, ensure_pos_indexes, backfill_units_per_package, normalize_phone, product_in_branch
 
 
 # ---------- Setup ----------
@@ -100,6 +100,15 @@ class CreateWorker(BaseModel):
     branch_id: Optional[str] = None
 
 
+class UpdateWorker(BaseModel):
+    name: str
+    surname: str = ""
+    phone: str = ""
+    email: Optional[EmailStr] = None
+    password: Optional[str] = None  # bo'sh — parol o'zgarmaydi
+    branch_id: Optional[str] = None
+
+
 class ProductIn(BaseModel):
     name: str
     description: str
@@ -112,7 +121,7 @@ class ProductIn(BaseModel):
     barcode: str = ""
     expiry_date: str = ""
     branch_id: Optional[str] = None
-    all_branches: bool = True
+    all_branches: bool = False  # True — barcha filiallarda ko'rinadi (faqat director)
     parent_barcode: str = ""  # Eski barkod — variantlar bog'lanishi uchun
     sku: str = ""  # Ichki artikul — POS qidiruvida nom/shtrix-kod bilan birga ishlatiladi
     units_per_package: int = 0  # Qadoqdagi dona/tabletka soni (0 = nomdan avtomatik aniqlanadi)
@@ -228,6 +237,67 @@ def apply_branch_filter_to_query(query: dict, user: dict, requested_branch_id: O
         query["branch_id"] = {"$exists": False}
         return query
     query["branch_id"] = target_branch
+    return query
+
+
+def product_scope_query(user: dict) -> Optional[dict]:
+    """Filialga biriktirilgan foydalanuvchi ko'ra oladigan mahsulotlar sharti.
+    None — cheklov yo'q (director yoki filialsiz admin)."""
+    if user.get("role") == "director":
+        return None
+    if user.get("role") == "admin" and not user.get("branch_id"):
+        return None
+    if not user.get("branch_id"):
+        return {"id": {"$in": []}}
+    return {"$or": [{"all_branches": True}, {"branch_id": user["branch_id"]}]}
+
+
+def can_manage_all_branches(user: dict) -> bool:
+    return user.get("role") == "director" or (user.get("role") == "admin" and not user.get("branch_id"))
+
+
+async def get_product_for_user(pid: str, user: dict, write: bool = False) -> dict:
+    """Mahsulotni filial ruxsatini tekshirib qaytaradi.
+    write=True — tahrirlash/o'chirish: filial xodimi faqat o'z filiali mahsulotini o'zgartira oladi
+    (umumiy "barcha filiallar" mahsulotlari faqat o'qish uchun)."""
+    product = await db.products.find_one({"id": pid}, {"_id": 0})
+    if not product:
+        raise HTTPException(status_code=404, detail="Mahsulot topilmadi")
+    if can_manage_all_branches(user):
+        return product
+    my_branch = user.get("branch_id")
+    own = bool(my_branch) and product.get("branch_id") == my_branch and not product.get("all_branches")
+    if own or (not write and my_branch and product.get("all_branches")):
+        return product
+    raise HTTPException(status_code=403, detail="Bu filial mahsulotiga ruxsat yo'q")
+
+
+async def resolve_product_branch(payload: dict, user: dict, old: Optional[dict] = None):
+    """Mahsulot uchun branch_id ni tekshiradi va payload ga yozadi."""
+    branch_id = payload.get("branch_id")
+    if not can_manage_all_branches(user):
+        # Filial xodimi filialni tanlay olmaydi — doim o'z filiali
+        if branch_id and branch_id != user.get("branch_id"):
+            raise HTTPException(403, "Faqat o'z filialingiz mahsulotlari bilan ishlay olasiz")
+        branch_id = user.get("branch_id")
+        payload["all_branches"] = False
+    elif user.get("role") == "director":
+        payload["all_branches"] = bool(payload.get("all_branches"))
+    else:
+        payload["all_branches"] = False
+    if not branch_id:
+        raise HTTPException(400, "Filialni tanlang")
+    if not (old and old.get("branch_id") == branch_id) and not await db.branches.find_one({"id": branch_id}):
+        raise HTTPException(400, "Filial topilmadi")
+    payload["branch_id"] = branch_id
+
+
+def barcode_conflict_query(payload: dict) -> dict:
+    """Shtrix-kod filial ichida unikal: bir xil tovar har filialga alohida kiritilishi mumkin.
+    Umumiy (barcha filiallar) mahsulot esa har qanday filialdagi bir xil kod bilan to'qnashadi."""
+    query = {"barcode": payload["barcode"]}
+    if not payload.get("all_branches"):
+        query["$or"] = [{"branch_id": payload.get("branch_id")}, {"all_branches": True}]
     return query
 
 
@@ -413,16 +483,20 @@ async def list_products(
     page = max(1, int(page))
     query = {} if include_deleted else {"deleted": {"$ne": True}}
     user = await try_current_user(request)
-    if user and user["role"] in ("admin", "worker"):
-        if branch_id and user.get("branch_id") and branch_id != user["branch_id"]:
-            raise HTTPException(status_code=403, detail="Bu filial mahsulotlarini ko'ra olmaysiz")
-        target_branch = branch_id or user.get("branch_id")
-        if not target_branch and user["role"] == "worker":
-            return []
-        if target_branch:
-            query["$and"] = [{"$or": [{"all_branches": True}, {"branch_id": target_branch}, {"branch_id": {"$exists": False}}]}]
-    elif user and user["role"] == "director" and branch_id:
-        query["branch_id"] = branch_id
+    and_filters = []
+    if user and user["role"] in ("admin", "worker", "director"):
+        if can_manage_all_branches(user):
+            if branch_id == "none":
+                # Filiali o'chirilgan / biriktirilmagan mahsulotlar
+                and_filters.append({"branch_id": None, "all_branches": {"$ne": True}})
+            elif branch_id:
+                and_filters.append({"branch_id": branch_id})
+        else:
+            if not user.get("branch_id"):
+                return []
+            if branch_id and branch_id != user["branch_id"]:
+                raise HTTPException(status_code=403, detail="Bu filial mahsulotlarini ko'ra olmaysiz")
+            and_filters.append(product_scope_query(user))
 
     if stock_status == "in_stock":
         query["stock"] = {"$gt": 0}
@@ -462,6 +536,8 @@ async def list_products(
             {"category": prefix},
             {"description": prefix},
         ]
+    if and_filters:
+        query["$and"] = and_filters
 
     sort_field = "created_at"
     sort_direction = -1
@@ -503,7 +579,10 @@ async def list_products(
 
 @api.get("/products/deleted")
 async def list_deleted_products(user=Depends(require_roles("admin"))):
-    items = await db.products.find({"deleted": True}, {"_id": 0}).sort("deleted_at", -1).to_list(1000)
+    query = {"deleted": True}
+    if not can_manage_all_branches(user):
+        query["branch_id"] = user.get("branch_id")
+    items = await db.products.find(query, {"_id": 0}).sort("deleted_at", -1).to_list(1000)
     return [public_product(p, hide_cost=False) for p in items]
 
 
@@ -528,39 +607,29 @@ async def best_sellers():
 
 @api.get("/products/{pid}")
 async def get_product(pid: str, request: Request):
-    p = await db.products.find_one({"id": pid}, {"_id": 0})
-    if not p:
-        raise HTTPException(404, "Mahsulot topilmadi")
     user = await try_current_user(request)
-    if user and user["role"] in ("admin", "worker"):
-        target_branch = user.get("branch_id")
-        if target_branch and not p.get("all_branches") and p.get("branch_id") and p["branch_id"] != target_branch:
-            raise HTTPException(status_code=403, detail="Bu filial mahsulitlarini ko'ra olmaysiz")
-        if target_branch and not p.get("all_branches") and p.get("branch_id") is None:
-            return public_product(p, hide_cost=hide)
-    hide = not (user and user["role"] in ("admin", "director"))
-    return public_product(p, hide_cost=hide)
+    if user and user["role"] in ("admin", "worker", "director"):
+        p = await get_product_for_user(pid, user)
+    else:
+        p = await db.products.find_one({"id": pid}, {"_id": 0})
+        if not p:
+            raise HTTPException(404, "Mahsulot topilmadi")
+    p = public_product(p, hide_cost=not (user and user["role"] in ("admin", "director")))
+    return p
 
 
 @api.post("/products")
-async def create_product(data: ProductIn, user=Depends(require_roles("admin", "director"))):
+async def create_product(data: ProductIn, user=Depends(require_roles("admin", "director", "worker"))):
     p = data.model_dump()
     if p["price"] < 0 or p["cost_price"] < 0:
         raise HTTPException(400, "Narx manfiy bo'lmasligi kerak")
     if p["discount_percent"] < 0 or p["discount_percent"] > 100:
         raise HTTPException(400, "Chegirma 0 dan 100 gacha bo'lishi kerak")
+    await resolve_product_branch(p, user)
     if p.get("barcode"):
-        exists = await db.products.find_one({"barcode": p["barcode"]})
+        exists = await db.products.find_one(barcode_conflict_query(p))
         if exists:
-            raise HTTPException(400, "Bu shtrix-kod allaqachon mavjud")
-    if user.get("role") == "admin":
-        branch_id = p.get("branch_id") or user.get("branch_id")
-        if not branch_id:
-            raise HTTPException(400, "Mahsulot filialga biriktirilishi kerak")
-        p["branch_id"] = branch_id
-        p["all_branches"] = False
-    else:
-        p["branch_id"] = p.get("branch_id")
+            raise HTTPException(400, "Bu shtrix-kod ushbu filialda allaqachon mavjud")
     p["id"] = str(uuid.uuid4())
     p["created_at"] = datetime.now(timezone.utc).isoformat()
     await db.products.insert_one(p)
@@ -568,29 +637,31 @@ async def create_product(data: ProductIn, user=Depends(require_roles("admin", "d
 
 
 @api.put("/products/{pid}")
-async def update_product(pid: str, data: ProductIn, user=Depends(require_roles("admin", "director"))):
+async def update_product(pid: str, data: ProductIn, user=Depends(require_roles("admin", "director", "worker"))):
+    old = await get_product_for_user(pid, user, write=True)
     payload = data.model_dump()
     if payload["price"] < 0 or payload["cost_price"] < 0:
         raise HTTPException(400, "Narx manfiy bo'lmasligi kerak")
     if payload["discount_percent"] < 0 or payload["discount_percent"] > 100:
         raise HTTPException(400, "Chegirma 0 dan 100 gacha bo'lishi kerak")
+    await resolve_product_branch(payload, user, old)
+    if user.get("role") == "worker":
+        # Xodim xarid narxini ko'rmaydi — formadan kelgan 0 eski qiymatni o'chirib yubormasin
+        payload["cost_price"] = old.get("cost_price", 0)
     if payload.get("barcode"):
-        exists = await db.products.find_one({"barcode": payload["barcode"], "id": {"$ne": pid}})
+        exists = await db.products.find_one({**barcode_conflict_query(payload), "id": {"$ne": pid}})
         if exists:
-            raise HTTPException(400, "Bu shtrix-kod boshqa mahsulotda mavjud")
-    if user["role"] == "admin" and user.get("branch_id"):
-        payload["branch_id"] = user["branch_id"]
-        payload["all_branches"] = False
+            raise HTTPException(400, "Bu shtrix-kod ushbu filialdagi boshqa mahsulotda mavjud")
 
     # Audit log
-    old = await db.products.find_one({"id": pid}, {"_id": 0})
     if old:
         changes = []
         field_labels = {
             "name": "Nomi", "description": "Tavsif", "price": "Narx",
             "cost_price": "Xarid narxi", "discount_percent": "Chegirma",
             "image_url": "Rasm", "category": "Kategoriya",
-            "stock": "Miqdor", "barcode": "Shtrix-kod", "expiry_date": "Yaroqlilik muddati"
+            "stock": "Miqdor", "barcode": "Shtrix-kod", "expiry_date": "Yaroqlilik muddati",
+            "branch_id": "Filial",
         }
         for field, label in field_labels.items():
             old_val = old.get(field)
@@ -617,8 +688,9 @@ async def update_product(pid: str, data: ProductIn, user=Depends(require_roles("
 
 
 @api.delete("/products/{pid}")
-async def delete_product(pid: str, user=Depends(require_roles("admin", "director"))):
+async def delete_product(pid: str, user=Depends(require_roles("admin", "director", "worker"))):
     """Soft delete: mahsulot 'deleted' deb belgilanadi, qaytarib olish mumkin."""
+    await get_product_for_user(pid, user, write=True)
     await db.products.update_one(
         {"id": pid},
         {"$set": {"deleted": True, "deleted_at": datetime.now(timezone.utc).isoformat()}},
@@ -627,7 +699,8 @@ async def delete_product(pid: str, user=Depends(require_roles("admin", "director
 
 
 @api.post("/products/{pid}/restore")
-async def restore_product(pid: str, user=Depends(require_roles("admin", "director"))):
+async def restore_product(pid: str, user=Depends(require_roles("admin", "director", "worker"))):
+    await get_product_for_user(pid, user, write=True)
     await db.products.update_one(
         {"id": pid},
         {"$set": {"deleted": False}, "$unset": {"deleted_at": ""}},
@@ -643,10 +716,11 @@ class StockAddIn(BaseModel):
 
 
 @api.post("/products/{pid}/stock-add")
-async def add_stock(pid: str, data: StockAddIn, user=Depends(require_roles("admin"))):
+async def add_stock(pid: str, data: StockAddIn, user=Depends(require_roles("admin", "worker"))):
     """Mavjud mahsulotga ombor sonini qo'shish (skanerda hech narsa o'zgartirilmagan holat)."""
     if data.add <= 0:
         raise HTTPException(400, "Qo'shiladigan miqdor 0 dan katta bo'lishi kerak")
+    await get_product_for_user(pid, user, write=True)
     res = await db.products.update_one({"id": pid}, {"$inc": {"stock": data.add}})
     if res.matched_count == 0:
         raise HTTPException(404, "Mahsulot topilmadi")
@@ -743,6 +817,8 @@ async def create_sale(data: SaleIn, user=Depends(require_roles("worker"))):
     product = await db.products.find_one({"id": data.product_id}, {"_id": 0})
     if not product:
         raise HTTPException(404, "Mahsulot topilmadi")
+    if not product_in_branch(product, user.get("branch_id")):
+        raise HTTPException(403, "Bu mahsulot sizning filialingizga tegishli emas")
     current_stock = int(product.get("stock", 0) or 0)
     if current_stock <= 0:
         raise HTTPException(400, "Mahsulot tugagan, sotib bolmaydi")
@@ -846,6 +922,8 @@ async def create_multi_sale(data: MultiSaleIn, user=Depends(require_roles("worke
         product = await db.products.find_one({"id": item.product_id}, {"_id": 0})
         if not product:
             continue
+        if not product_in_branch(product, user.get("branch_id")):
+            raise HTTPException(403, f"{product.get('name', '')} — sizning filialingizga tegishli emas")
         item_stock = int(product.get("stock", 0) or 0)
         if item_stock <= 0:
             raise HTTPException(400, f"{product.get('name','Mahsulot')} tugagan, sotib bolmaydi")
@@ -1140,13 +1218,17 @@ async def update_branch(bid: str, data: BranchIn, user=Depends(require_roles("di
         "active": data.active,
     }
     await db.branches.update_one({"id": bid}, {"$set": update})
+    if update["name"] != existing.get("name"):
+        await db.users.update_many({"branch_id": bid}, {"$set": {"branch_name": update["name"]}})
     return {**existing, **update}
 
 
 @api.delete("/branches/{bid}")
 async def delete_branch(bid: str, user=Depends(require_roles("director", "admin"))):
-    if user["role"] == "admin" and user.get("branch_id") and bid != user["branch_id"]:
-        raise HTTPException(status_code=403, detail="Siz boshqa filialni o'chira olmaysiz")
+    # Filial admini filialni o'chira olmaydi: aks holda u filialsiz (barcha filiallarga
+    # ruxsatli) adminga aylanib qolardi.
+    if user["role"] == "admin" and user.get("branch_id"):
+        raise HTTPException(status_code=403, detail="Filialni faqat director yoki bosh admin o'chira oladi")
     branch = await db.branches.find_one({"id": bid}, {"_id": 0})
     if not branch:
         raise HTTPException(status_code=404, detail="Filial topilmadi")
@@ -1212,6 +1294,44 @@ async def create_worker(data: CreateWorker, user=Depends(require_roles("director
     }
     await db.users.insert_one(w)
     return serialize_user(w)
+
+
+@api.put("/users/workers/{wid}")
+async def update_worker(wid: str, data: UpdateWorker, user=Depends(require_roles("director", "admin"))):
+    target = await db.users.find_one({"id": wid, "role": "worker"}, {"_id": 0})
+    if not target:
+        raise HTTPException(404, "Ishchi topilmadi")
+    my_branch = user.get("branch_id") if user["role"] == "admin" else None
+    if my_branch and target.get("branch_id") != my_branch:
+        raise HTTPException(status_code=403, detail="Bu filial ishchisini tahrirlay olmaysiz")
+    branch_id = data.branch_id or None
+    if my_branch and branch_id != my_branch:
+        raise HTTPException(status_code=403, detail="Ishchini boshqa filialga o'tkaza olmaysiz")
+    if not branch_id:
+        raise HTTPException(400, "Filialni tanlang")
+    branch = await db.branches.find_one({"id": branch_id}, {"_id": 0})
+    if not branch:
+        raise HTTPException(400, "Filial topilmadi")
+    if not data.name.strip():
+        raise HTTPException(400, "Ism majburiy")
+    update = {
+        "name": data.name.strip(),
+        "surname": data.surname.strip(),
+        "phone": data.phone.strip(),
+        "branch_id": branch_id,
+        "branch_name": branch.get("name"),
+    }
+    if data.email and data.email.lower() != target["email"]:
+        email = data.email.lower()
+        if await db.users.find_one({"email": email}):
+            raise HTTPException(400, "Bu email allaqachon mavjud")
+        update["email"] = email
+    if data.password:
+        if len(data.password) < 6:
+            raise HTTPException(400, "Parol kamida 6 belgidan iborat bo'lishi kerak")
+        update["password_hash"] = hash_password(data.password)
+    await db.users.update_one({"id": wid}, {"$set": update})
+    return serialize_user({**target, **update})
 
 
 @api.delete("/users/workers/{wid}")
@@ -1486,9 +1606,14 @@ app.include_router(api)
 
 # ---------- Startup ----------
 async def seed_initial_data():
+    await db.products.update_many(
+        {"branch_id": {"$exists": False}},
+        {"$set": {"branch_id": None, "all_branches": True}},
+    )
     await db.users.create_index("email", unique=True)
     await db.products.create_index("id", unique=True)
     await db.products.create_index("barcode")
+    await db.products.create_index("branch_id")
     await db.products.create_index([("deleted", 1), ("barcode", 1)])
     await db.products.create_index([("deleted", 1), ("sku", 1)])
     await db.products.create_index([("deleted", 1), ("name", 1)])
