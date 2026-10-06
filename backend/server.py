@@ -1816,101 +1816,110 @@ async def seed_initial_data():
     elif not verify_password(admin_pw, existing["password_hash"]):
         await db.users.update_one({"email": admin_email}, {"$set": {"password_hash": hash_password(admin_pw)}})
 
-    # Real products from products_seed.json (CSV-derived inventory, 856 items)
-    # IDEMPOTENT: inserts only products whose barcode is not already in DB.
-    # Safe to re-run on every startup; existing admin-edited products are never touched.
-    seed_path = ROOT_DIR / "products_seed.json"
-    if seed_path.exists():
-        import json as _json
-        try:
-            with open(seed_path, "r", encoding="utf-8") as _f:
-                seed_products = _json.load(_f)
-        except Exception as e:
-            logger.error("Failed to read products_seed.json: %s", e)
-            seed_products = []
+    # Boshlang'ich mahsulotlar (seed / demo) faqat BIR MARTA qo'shiladi. Belgi bazada saqlanadi —
+    # mahsulotlar keyin o'chirilsa (masalan, Excel orqali boshidan kiritish uchun) qayta paydo bo'lmaydi.
+    seed_marker = await db.app_meta.find_one({"_id": "products_seed_done"})
+    if not seed_marker:
+        # Real products from products_seed.json (CSV-derived inventory, 856 items)
+        # IDEMPOTENT: inserts only products whose barcode is not already in DB.
+        # Safe to re-run on every startup; existing admin-edited products are never touched.
+        seed_path = ROOT_DIR / "products_seed.json"
+        if seed_path.exists():
+            import json as _json
+            try:
+                with open(seed_path, "r", encoding="utf-8") as _f:
+                    seed_products = _json.load(_f)
+            except Exception as e:
+                logger.error("Failed to read products_seed.json: %s", e)
+                seed_products = []
 
-        if seed_products:
-            existing_barcodes = set()
-            async for p in db.products.find(
-                {"barcode": {"$exists": True, "$ne": ""}}, {"_id": 0, "barcode": 1}
-            ):
-                bc = (p.get("barcode") or "").strip()
-                if bc:
-                    existing_barcodes.add(bc)
-            existing_names_no_bc = set()
-            async for p in db.products.find(
-                {"$or": [{"barcode": ""}, {"barcode": {"$exists": False}}]},
-                {"_id": 0, "name": 1},
-            ):
-                existing_names_no_bc.add((p.get("name") or "").strip().lower())
+            if seed_products:
+                existing_barcodes = set()
+                async for p in db.products.find(
+                    {"barcode": {"$exists": True, "$ne": ""}}, {"_id": 0, "barcode": 1}
+                ):
+                    bc = (p.get("barcode") or "").strip()
+                    if bc:
+                        existing_barcodes.add(bc)
+                existing_names_no_bc = set()
+                async for p in db.products.find(
+                    {"$or": [{"barcode": ""}, {"barcode": {"$exists": False}}]},
+                    {"_id": 0, "name": 1},
+                ):
+                    existing_names_no_bc.add((p.get("name") or "").strip().lower())
 
-            now_iso = datetime.now(timezone.utc).isoformat()
-            seen_seed_barcodes = set()
-            to_insert = []
-            for d in seed_products:
-                bc = (d.get("barcode") or "").strip()
-                if bc:
-                    if bc in existing_barcodes or bc in seen_seed_barcodes:
-                        continue
-                    seen_seed_barcodes.add(bc)
+                now_iso = datetime.now(timezone.utc).isoformat()
+                seen_seed_barcodes = set()
+                to_insert = []
+                for d in seed_products:
+                    bc = (d.get("barcode") or "").strip()
+                    if bc:
+                        if bc in existing_barcodes or bc in seen_seed_barcodes:
+                            continue
+                        seen_seed_barcodes.add(bc)
+                    else:
+                        nm = (d.get("name") or "").strip().lower()
+                        if nm in existing_names_no_bc:
+                            continue
+                    doc = dict(d)
+                    doc["id"] = str(uuid.uuid4())
+                    doc["created_at"] = now_iso
+                    to_insert.append(doc)
+
+                if to_insert:
+                    CHUNK = 500
+                    for i in range(0, len(to_insert), CHUNK):
+                        await db.products.insert_many(to_insert[i:i + CHUNK])
+                    logger.info(
+                        "Seeded %d new products from products_seed.json (skipped %d already-present)",
+                        len(to_insert), len(seed_products) - len(to_insert),
+                    )
                 else:
-                    nm = (d.get("name") or "").strip().lower()
-                    if nm in existing_names_no_bc:
-                        continue
-                doc = dict(d)
-                doc["id"] = str(uuid.uuid4())
-                doc["created_at"] = now_iso
-                to_insert.append(doc)
+                    logger.info(
+                        "products_seed.json: all %d items already in DB, nothing to seed",
+                        len(seed_products),
+                    )
 
-            if to_insert:
-                CHUNK = 500
-                for i in range(0, len(to_insert), CHUNK):
-                    await db.products.insert_many(to_insert[i:i + CHUNK])
-                logger.info(
-                    "Seeded %d new products from products_seed.json (skipped %d already-present)",
-                    len(to_insert), len(seed_products) - len(to_insert),
-                )
-            else:
-                logger.info(
-                    "products_seed.json: all %d items already in DB, nothing to seed",
-                    len(seed_products),
-                )
-
-    if await db.products.count_documents({}) == 0:
-        demo = [
-            {
-                "name": "Hyaluron Glow Serum",
-                "description": "Yuzga namlik beruvchi va terini yorug'lashtiruvchi yengil zardob. 30ml.",
-                "price": 285000, "cost_price": 180000, "discount_percent": 10,
-                "image_url": "https://static.prod-images.emergentagent.com/jobs/42a44add-5feb-4f26-bbbe-91660dd15858/images/6c81797aa02470f660c1607df9805d01242fe23e50b576d24dd4b74e26a17c7e.png",
-                "category": "serum", "stock": 50, "barcode": "8901234567001", "expiry_date": "2027-06-30",
-            },
-            {
-                "name": "Velvet Night Cream",
-                "description": "Tunda ishlaydigan, terini tiklaydigan boy kechki krem. 50ml.",
-                "price": 320000, "cost_price": 210000, "discount_percent": 0,
-                "image_url": "https://static.prod-images.emergentagent.com/jobs/42a44add-5feb-4f26-bbbe-91660dd15858/images/368a89711f89c8185079803e32c9df624381192274ce0052518533f3aef2aa80.png",
-                "category": "cream", "stock": 30, "barcode": "8901234567002", "expiry_date": "2027-03-15",
-            },
-            {
-                "name": "Silk Lotion",
-                "description": "Tana uchun yengil va shimibgina ketadigan lotion. Yasmin va vanil hidi.",
-                "price": 195000, "cost_price": 120000, "discount_percent": 5,
-                "image_url": "https://images.unsplash.com/photo-1688380337044-18c03ba32199?crop=entropy&cs=srgb&fm=jpg&ixlib=rb-4.1.0&q=85",
-                "category": "body", "stock": 40, "barcode": "8901234567003", "expiry_date": "2026-12-01",
-            },
-            {
-                "name": "Atelier Trio Set",
-                "description": "Tozalovchi, tonizator va krem - to'liq parvarish to'plami.",
-                "price": 540000, "cost_price": 350000, "discount_percent": 15,
-                "image_url": "https://images.pexels.com/photos/7256060/pexels-photo-7256060.jpeg?auto=compress&cs=tinysrgb&dpr=2&h=650&w=940",
-                "category": "set", "stock": 20, "barcode": "8901234567004", "expiry_date": "2027-09-20",
-            },
-        ]
-        for d in demo:
-            d["id"] = str(uuid.uuid4())
-            d["created_at"] = datetime.now(timezone.utc).isoformat()
-            await db.products.insert_one(d)
+        if await db.products.count_documents({}) == 0:
+            demo = [
+                {
+                    "name": "Hyaluron Glow Serum",
+                    "description": "Yuzga namlik beruvchi va terini yorug'lashtiruvchi yengil zardob. 30ml.",
+                    "price": 285000, "cost_price": 180000, "discount_percent": 10,
+                    "image_url": "https://static.prod-images.emergentagent.com/jobs/42a44add-5feb-4f26-bbbe-91660dd15858/images/6c81797aa02470f660c1607df9805d01242fe23e50b576d24dd4b74e26a17c7e.png",
+                    "category": "serum", "stock": 50, "barcode": "8901234567001", "expiry_date": "2027-06-30",
+                },
+                {
+                    "name": "Velvet Night Cream",
+                    "description": "Tunda ishlaydigan, terini tiklaydigan boy kechki krem. 50ml.",
+                    "price": 320000, "cost_price": 210000, "discount_percent": 0,
+                    "image_url": "https://static.prod-images.emergentagent.com/jobs/42a44add-5feb-4f26-bbbe-91660dd15858/images/368a89711f89c8185079803e32c9df624381192274ce0052518533f3aef2aa80.png",
+                    "category": "cream", "stock": 30, "barcode": "8901234567002", "expiry_date": "2027-03-15",
+                },
+                {
+                    "name": "Silk Lotion",
+                    "description": "Tana uchun yengil va shimibgina ketadigan lotion. Yasmin va vanil hidi.",
+                    "price": 195000, "cost_price": 120000, "discount_percent": 5,
+                    "image_url": "https://images.unsplash.com/photo-1688380337044-18c03ba32199?crop=entropy&cs=srgb&fm=jpg&ixlib=rb-4.1.0&q=85",
+                    "category": "body", "stock": 40, "barcode": "8901234567003", "expiry_date": "2026-12-01",
+                },
+                {
+                    "name": "Atelier Trio Set",
+                    "description": "Tozalovchi, tonizator va krem - to'liq parvarish to'plami.",
+                    "price": 540000, "cost_price": 350000, "discount_percent": 15,
+                    "image_url": "https://images.pexels.com/photos/7256060/pexels-photo-7256060.jpeg?auto=compress&cs=tinysrgb&dpr=2&h=650&w=940",
+                    "category": "set", "stock": 20, "barcode": "8901234567004", "expiry_date": "2027-09-20",
+                },
+            ]
+            for d in demo:
+                d["id"] = str(uuid.uuid4())
+                d["created_at"] = datetime.now(timezone.utc).isoformat()
+                await db.products.insert_one(d)
+        await db.app_meta.update_one(
+            {"_id": "products_seed_done"},
+            {"$set": {"done_at": datetime.now(timezone.utc).isoformat()}},
+            upsert=True,
+        )
 
     await db.products.update_many({"cost_price": {"$exists": False}}, {"$set": {"cost_price": 0}})
     await db.products.update_many({"discount_percent": {"$exists": False}}, {"$set": {"discount_percent": 0}})
