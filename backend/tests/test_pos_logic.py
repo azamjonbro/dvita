@@ -157,3 +157,33 @@ class TestMisc:
     def test_line_totals_caps_discount_at_100(self):
         t = line_totals(1000, 1, 80, 50)
         assert t["unit_price"] == 0 and t["discount_percent"] == 100
+
+
+# ---------- Dona / ml ----------
+from pos_logic import package_from_product  # noqa: E402
+
+
+@pytest.mark.parametrize("name, expected", [
+    ("АЛЛЕРТ-Г КИДС 150МЛ СИРОП №1", ("ml", 150.0)),
+    ("L-КАРНИТИН 3000МГ 500МЛ", ("ml", 500.0)),
+    ("СИРОП 2,5ML", ("ml", 2.5)),
+    ("5-HTP 100МГ КАПС №120 ( NOW )", ("dona", 120)),
+    ("АМПУЛА 2МЛ №10", ("dona", 10)),          # ampulalar — dona
+    ("ВИТАМИН Д3 1МЛН ТАБ №60", ("dona", 60)),  # "МЛН" ml emas
+])
+def test_package_unit_detection(name, expected):
+    assert package_from_product({"name": name}) == expected
+
+
+def test_regimen_in_ml_with_fractional_dose():
+    # 150 ml sirop, kuniga 3 mahal 5 ml -> 15 ml/kun -> 10 kun
+    r = compute_regimen(quantity=1, units_per_package=150, times_per_day=3,
+                        units_per_intake=5, course_start=date(2026, 10, 1))
+    assert (r["total_units"], r["daily_usage"], r["estimated_days"]) == (150, 15, 10)
+    assert r["estimated_end_date"] == "2026-10-11"
+    # 2 shisha × 100 ml, kuniga 2 mahal 2.5 ml -> 5 ml/kun -> 40 kun
+    r = compute_regimen(quantity=2, units_per_package=100, times_per_day=2, units_per_intake=2.5)
+    assert (r["total_units"], r["daily_usage"], r["estimated_days"]) == (200, 5, 40)
+    # 0.1 qadamli dozada suzuvchi nuqta xatosi kunni kamaytirmasin
+    r = compute_regimen(quantity=1, units_per_package=3, times_per_day=1, units_per_intake=0.3)
+    assert r["estimated_days"] == 10

@@ -20,7 +20,7 @@ import logging
 import re
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
@@ -43,7 +43,10 @@ from pos_logic import (
     parse_date,
     phone_tail,
     sanitize_rules,
+    tidy_amount,
     units_from_product,
+    package_from_product,
+    UNIT_LABELS,
 )
 
 
@@ -83,10 +86,11 @@ class CustomerRef(CustomerIn):
 
 
 class RegimenIn(BaseModel):
-    units_per_package: int = 1
-    total_units: Optional[int] = None  # berilmasa quantity × units_per_package
+    unit_type: Literal["dona", "ml"] = "dona"  # dori dona (tabletka) yoki ml (sirop) bilan o'lchanadi
+    units_per_package: float = 1  # qadoqdagi dona soni yoki ml hajmi
+    total_units: Optional[float] = None  # berilmasa quantity × units_per_package
     times_per_day: int = 0
-    units_per_intake: int = 0
+    units_per_intake: float = 0  # har mahal: dona yoki ml (2.5 ml bo'lishi mumkin)
     recommendation: str = ""
     course_start_date: Optional[str] = None  # YYYY-MM-DD
 
@@ -164,7 +168,8 @@ def _customer_view(c: dict) -> dict:
 def _regimen_text(reg: Optional[dict]) -> str:
     if not reg or not reg.get("daily_usage"):
         return ""
-    txt = f"Kuniga {reg['times_per_day']} mahal, har mahal {reg['units_per_intake']} tadan"
+    unit = UNIT_LABELS.get(reg.get("unit_type") or "dona", "dona")
+    txt = f"Kuniga {reg['times_per_day']} mahal, har mahal {tidy_amount(reg['units_per_intake'])} {unit}dan"
     if reg.get("recommendation"):
         txt += f" — {reg['recommendation']}"
     return txt
@@ -260,7 +265,7 @@ def build_pos_router(*, db, client, require_roles: Callable, public_product: Cal
         out = []
         for p in items:
             v = public_product(p, hide_cost=True)
-            v["units_per_package"] = units_from_product(p)
+            v["unit_type"], v["units_per_package"] = package_from_product(p)
             v.setdefault("sku", "")
             out.append(v)
         return out
@@ -433,16 +438,17 @@ def build_pos_router(*, db, client, require_roles: Callable, public_product: Cal
                 if not reg or reg.times_per_day <= 0 or reg.units_per_intake <= 0:
                     raise HTTPException(400, f"{product['name']}: kuniga necha mahal va har mahal nechtadan — majburiy")
                 start = parse_date(reg.course_start_date, today)
-                upp = reg.units_per_package if reg.units_per_package > 0 else units_from_product(product)
+                upp = reg.units_per_package if reg.units_per_package > 0 else package_from_product(product)[1]
                 calc = compute_regimen(quantity=it.quantity, units_per_package=upp,
                                        times_per_day=reg.times_per_day, units_per_intake=reg.units_per_intake,
                                        course_start=start, total_units=reg.total_units)
                 if calc["total_units"] <= 0:
-                    raise HTTPException(400, f"{product['name']}: jami dona soni 0 dan katta bo'lishi kerak")
+                    raise HTTPException(400, f"{product['name']}: jami {reg.unit_type} miqdori 0 dan katta bo'lishi kerak")
                 regimen = {
-                    "units_per_package": upp,
+                    "unit_type": reg.unit_type,
+                    "units_per_package": tidy_amount(upp),
                     "times_per_day": reg.times_per_day,
-                    "units_per_intake": reg.units_per_intake,
+                    "units_per_intake": tidy_amount(reg.units_per_intake),
                     "recommendation": reg.recommendation.strip(),
                     **calc,
                 }
@@ -543,6 +549,7 @@ def build_pos_router(*, db, client, require_roles: Callable, public_product: Cal
                     "line_total": t["line_total"],
                     "discount_total": t["discount_total"],
                     "is_medicine": bool(it.is_medicine),
+                    "unit_type": reg.get("unit_type", "dona"),
                     "units_per_package": reg.get("units_per_package"),
                     "total_units": reg.get("total_units"),
                     "times_per_day": reg.get("times_per_day"),

@@ -111,31 +111,66 @@ def units_from_product(product: dict) -> int:
     return 1
 
 
-def compute_daily_usage(times_per_day: int, units_per_intake: int) -> int:
-    t = max(int(times_per_day or 0), 0)
-    u = max(int(units_per_intake or 0), 0)
-    return t * u
+UNIT_TYPES = ("dona", "ml")
+UNIT_LABELS = {"dona": "dona", "ml": "ml"}
+_ML_RE = re.compile(r"(\d+(?:[.,]\d+)?)\s*(?:МЛ|ML)(?![A-Za-zА-Яа-яЁё])", re.IGNORECASE)
 
 
-def compute_estimated_days(total_units: int, daily_usage: int) -> int:
-    """Dori yetadigan TO'LIQ kunlar soni (pastga yaxlitlash). 20 dona / 3 = 6 kun."""
-    if daily_usage <= 0 or total_units <= 0:
+def package_from_product(product: dict) -> tuple:
+    """Qadoq birligi va miqdori: ('ml', 150.0) — sirop/tomchi, ('dona', 120) — tabletka/kapsula.
+
+    Nomda hajm (150МЛ) bo'lib, qadoqda bitta idish (№1 yoki № yo'q) bo'lsa — ml.
+    "2МЛ №10" kabi ampulalar dona hisoblanadi (10 ta ampula).
+    """
+    for text in (product.get("name") or "", product.get("description") or ""):
+        ml = _ML_RE.search(text)
+        if not ml:
+            continue
+        count = re.search(r"№\s*(\d+)", text)
+        if count is None or int(count.group(1)) <= 1:
+            return "ml", float(ml.group(1).replace(",", "."))
+        break
+    return "dona", units_from_product(product)
+
+
+def _num(value) -> float:
+    try:
+        return max(float(value or 0), 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def tidy_amount(value: float):
+    """5.0 -> 5 (butun bo'lsa int), 2.5 -> 2.5."""
+    value = round(float(value), 3)
+    return int(value) if value.is_integer() else value
+
+
+def compute_daily_usage(times_per_day, units_per_intake):
+    """Kunlik sarf: dona yoki ml (kasr bo'lishi mumkin — masalan 2.5 ml)."""
+    return tidy_amount(_num(times_per_day) * _num(units_per_intake))
+
+
+def compute_estimated_days(total_units, daily_usage) -> int:
+    """Dori yetadigan TO'LIQ kunlar soni (pastga yaxlitlash). 20 dona / 3 = 6 kun, 150 ml / 15 ml = 10 kun."""
+    total, daily = _num(total_units), _num(daily_usage)
+    if daily <= 0 or total <= 0:
         return 0
-    return int(total_units) // int(daily_usage)
+    return int(math.floor(total / daily + 1e-9))
 
 
-def compute_regimen(*, quantity: int, units_per_package: int, times_per_day: int,
-                    units_per_intake: int, course_start: Optional[date] = None,
-                    total_units: Optional[int] = None) -> dict:
-    """Bitta savat qatori uchun qabul tartibini to'liq hisoblaydi."""
+def compute_regimen(*, quantity: int, units_per_package, times_per_day: int,
+                    units_per_intake, course_start: Optional[date] = None,
+                    total_units=None) -> dict:
+    """Bitta savat qatori uchun qabul tartibini to'liq hisoblaydi (dona yoki ml)."""
     start = course_start or local_today()
     if total_units is None:
-        total_units = max(int(quantity or 0), 0) * max(int(units_per_package or 0), 0)
+        total_units = _num(quantity) * _num(units_per_package)
     daily = compute_daily_usage(times_per_day, units_per_intake)
     days = compute_estimated_days(total_units, daily)
     end = start + timedelta(days=days) if days > 0 else None
     return {
-        "total_units": int(total_units),
+        "total_units": tidy_amount(_num(total_units)),
         "daily_usage": daily,
         "estimated_days": days,
         "course_start_date": start.isoformat(),
