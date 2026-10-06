@@ -27,6 +27,8 @@ from notifications import notify_director, notify_admin
 from reports import build_csv, build_pdf, _filter_in_month
 from pos import build_pos_router, ensure_pos_indexes, backfill_units_per_package, normalize_phone, product_in_branch
 from stock_import import parse_stock_workbook, StockImportError
+from inventory_report import NO_BRANCH_KEY, build_report, build_xlsx
+from pos_logic import local_today
 from pymongo import InsertOne, UpdateOne
 
 
@@ -44,8 +46,10 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await seed_initial_data()
+    snapshot_task = asyncio.create_task(stock_snapshot_loop())
     logger.info("Glow Cosmetics API ready")
     yield
+    snapshot_task.cancel()
     client.close()
 
 
@@ -788,7 +792,12 @@ async def import_stock(
         if product and mode == "receive":
             matched_ids.add(product["id"])
             summary["increased"] += 1
-            update = {"price": row["price"], "cost_price": row["cost_price"], "sku": row["sku"],
+            # Kirimda tannarx o'rtacha tortilgan bo'ladi: eski qoldiq eski narxda, yangisi yangi narxda
+            old_qty = max(int(product.get("stock") or 0), 0)
+            new_qty = old_qty + row["stock"]
+            avg_cost = (round((old_qty * float(product.get("cost_price") or 0) + row["stock"] * row["cost_price"])
+                              / new_qty, 2) if new_qty else row["cost_price"])
+            update = {"price": row["price"], "cost_price": avg_cost, "sku": row["sku"],
                       "manufacturer": row["manufacturer"], "stock_synced_at": now}
             # Eski partiya hali omborda — eng yaqin muddat saqlanadi
             if row["expiry_date"] and (not product.get("expiry_date") or row["expiry_date"] < product["expiry_date"]):
@@ -1733,6 +1742,123 @@ async def monthly_report(year: int, month: int, format: str = "pdf", user=Depend
         )
 
 
+# ---------- Ombor qiymati hisoboti ----------
+SNAPSHOT_INTERVAL_SECONDS = 30 * 60
+SNAPSHOT_FIELDS = {"_id": 0, "id": 1, "name": 1, "sku": 1, "barcode": 1, "stock": 1,
+                   "cost_price": 1, "price": 1, "branch_id": 1, "all_branches": 1}
+
+
+def _branch_product_query(key: str) -> dict:
+    base = {"deleted": {"$ne": True}, "stock": {"$gt": 0}}
+    if key == NO_BRANCH_KEY:
+        return {**base, "$or": [{"all_branches": True}, {"branch_id": None}]}
+    return {**base, "branch_id": key, "all_branches": {"$ne": True}}
+
+
+async def take_stock_snapshot() -> int:
+    """Bugungi (O'zbekiston vaqti) qoldiq suratini filiallar bo'yicha saqlaydi.
+    Kun davomida qayta yoziladi — kun tugagach oxirgi surat o'sha kunning yakuniy qoldig'i bo'ladi."""
+    today = local_today().isoformat()
+    now = datetime.now(timezone.utc).isoformat()
+    keys = [b["id"] for b in await db.branches.find({}, {"_id": 0, "id": 1}).to_list(1000)] + [NO_BRANCH_KEY]
+    for key in keys:
+        items = await db.products.find(_branch_product_query(key), SNAPSHOT_FIELDS).to_list(length=None)
+        await db.stock_snapshots.update_one(
+            {"_id": f"{today}:{key}"},
+            {"$set": {"date": today, "branch_key": key, "items": items, "updated_at": now}},
+            upsert=True,
+        )
+    return len(keys)
+
+
+async def stock_snapshot_loop():
+    while True:
+        try:
+            await take_stock_snapshot()
+        except Exception as exc:  # noqa: BLE001 — surat olinmasa ham server ishlashda davom etadi
+            logger.error("Stock snapshot failed: %s", exc)
+        await asyncio.sleep(SNAPSHOT_INTERVAL_SECONDS)
+
+
+async def _inventory_report(user: dict, branch_ids: str, date: Optional[str]) -> dict:
+    branches = await db.branches.find({}, {"_id": 0, "id": 1, "name": 1}).sort("name", 1).to_list(1000)
+    names = {b["id"]: b["name"] for b in branches}
+    if can_manage_all_branches(user):
+        allowed = [b["id"] for b in branches] + [NO_BRANCH_KEY]
+    else:
+        if not user.get("branch_id"):
+            raise HTTPException(403, "Filial biriktirilmagan")
+        allowed = [user["branch_id"]]
+    requested = [b for b in (branch_ids or "").split(",") if b.strip()]
+    if requested:
+        denied = [b for b in requested if b not in allowed]
+        if denied:
+            raise HTTPException(403, "Bu filial hisobotini ko'ra olmaysiz")
+        keys = requested
+    else:
+        keys = allowed
+
+    today = local_today()
+    target = today
+    if date:
+        try:
+            target = datetime.strptime(date, "%Y-%m-%d").date()
+        except ValueError:
+            raise HTTPException(400, "Sana YYYY-MM-DD formatida bo'lishi kerak")
+        if target > today:
+            raise HTTPException(400, "Kelajakdagi sana uchun qoldiq hisoblab bo'lmaydi")
+
+    products_by_branch, snapshot_dates = {}, {}
+    if target == today:
+        source = "live"
+        for key in keys:
+            products_by_branch[key] = await db.products.find(
+                _branch_product_query(key), SNAPSHOT_FIELDS).to_list(length=None)
+    else:
+        source = "snapshot"
+        iso = target.isoformat()
+        found_any = False
+        for key in keys:
+            snap = await db.stock_snapshots.find_one(
+                {"branch_key": key, "date": {"$lte": iso}}, {"_id": 0}, sort=[("date", -1)])
+            products_by_branch[key] = snap["items"] if snap else []
+            snapshot_dates[key] = snap["date"] if snap else None
+            found_any = found_any or bool(snap)
+        if not found_any:
+            first = await db.stock_snapshots.find_one({}, {"_id": 0, "date": 1}, sort=[("date", 1)])
+            since = first["date"] if first else today.isoformat()
+            raise HTTPException(400, f"{iso} sana uchun qoldiq ma'lumoti yo'q. Qoldiq tarixi {since} dan boshlab saqlanadi")
+    # Hisobotdagi filial ro'yxati faqat haqiqatda mavjud filiallar (umumiy qator — faqat mahsulot bo'lsa)
+    products_by_branch = {k: v for k, v in products_by_branch.items() if k != NO_BRANCH_KEY or v}
+    report = build_report(products_by_branch, names)
+    first = await db.stock_snapshots.find_one({}, {"_id": 0, "date": 1}, sort=[("date", 1)])
+    return {
+        **report,
+        "date": target.isoformat(),
+        "source": source,
+        "snapshot_dates": snapshot_dates,
+        "history_from": first["date"] if first else None,
+    }
+
+
+@api.get("/reports/inventory-value")
+async def inventory_value_report(branch_ids: str = "", date: Optional[str] = None,
+                                 user=Depends(require_roles("director", "admin"))):
+    return await _inventory_report(user, branch_ids, date)
+
+
+@api.get("/reports/inventory-value.xlsx")
+async def inventory_value_report_xlsx(branch_ids: str = "", date: Optional[str] = None,
+                                      user=Depends(require_roles("director", "admin"))):
+    report = await _inventory_report(user, branch_ids, date)
+    data = await asyncio.to_thread(build_xlsx, report, report["date"])
+    return StreamingResponse(
+        iter([data]),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f"attachment; filename=ombor-qiymati-{report['date']}.xlsx"},
+    )
+
+
 @api.get("/")
 async def health():
     return {"ok": True, "service": "Glow Cosmetics API"}
@@ -1770,6 +1896,7 @@ async def seed_initial_data():
     await db.products.create_index("id", unique=True)
     await db.products.create_index("barcode")
     await db.products.create_index("branch_id")
+    await db.stock_snapshots.create_index([("branch_key", 1), ("date", -1)])
     await db.products.create_index([("deleted", 1), ("barcode", 1)])
     await db.products.create_index([("deleted", 1), ("sku", 1)])
     await db.products.create_index([("deleted", 1), ("name", 1)])

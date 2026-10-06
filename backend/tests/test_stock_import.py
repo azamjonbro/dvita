@@ -89,6 +89,7 @@ def test_receive_creates_then_increments_and_stock_only_edits(branch):
     assert applied["created"] == 3
     products = _branch_products(s, bid)
     assert products["A2"]["stock"] == 5 and products["A2"]["expiry_date"] == "2028-01-01"
+    assert products["A2"]["cost_price"] == 206
     assert products["A1"]["branch_id"] == bid and products["A1"]["all_branches"] is False
 
     # Xuddi shu fayl qayta qabul qilinsa — soni oshadi, lekin ogohlantirish beriladi
@@ -101,7 +102,8 @@ def test_receive_creates_then_increments_and_stock_only_edits(branch):
     # Astatka: A1 soni o'zgardi, A3 faylda yo'q (0), A4 filialda yo'q (o'tkazib yuboriladi)
     second = _xlsx([
         ("A1", f"TEST Vitamin C {tag}", 1, "01.07.2029", 100, 160, f"BC{tag}1", 60),
-        ("A2", f"TEST Omega {tag}", 10, "01.01.2028", 210, 300, f"BC{tag}2", 90),
+        # A2: ikki partiyaning o'rtacha tortilgan tannarxi (2×200 + 3×210) / 5 = 206 — o'zgarmagan
+        ("A2", f"TEST Omega {tag}", 10, "01.01.2028", 206, 300, f"BC{tag}2", 90),
         ("A4", f"TEST Iron {tag}", 7, "01.02.2031", 70, 99, f"BC{tag}4", 30),
     ])
     synced = _upload(s, bid, second, apply=True, mode="stock").json()

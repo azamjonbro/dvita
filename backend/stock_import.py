@@ -66,7 +66,8 @@ def _expiry(value) -> str:
 
 def parse_stock_workbook(data: bytes) -> List[Dict]:
     """Excel'dan qoldiq qatorlarini o'qiydi. Bir xil tovar (kod/shtrix-kod) bir necha
-    partiyada kelsa — miqdorlar qo'shiladi, eng yaqin muddat va eng katta narx olinadi."""
+    partiyada kelsa — miqdorlar qo'shiladi, eng yaqin muddat, eng katta sotuv narxi va
+    o'rtacha tortilgan tannarx (Σ soni × narx ÷ Σ soni) olinadi."""
     try:
         wb = openpyxl.load_workbook(io.BytesIO(data), data_only=True, read_only=True)
     except Exception as exc:  # noqa: BLE001 — har qanday buzuq fayl
@@ -108,16 +109,21 @@ def parse_stock_workbook(data: bytes) -> List[Dict]:
         key = code or barcode
         prev = merged.get(key)
         if prev is None:
+            item["_cost_sum"] = item["stock"] * item["cost_price"]
             merged[key] = item
             continue
+        prev["_cost_sum"] += item["stock"] * item["cost_price"]
         prev["stock"] += item["stock"]
         if item["expiry_date"] and (not prev["expiry_date"] or item["expiry_date"] < prev["expiry_date"]):
             prev["expiry_date"] = item["expiry_date"]
         prev["price"] = max(prev["price"], item["price"])
-        prev["cost_price"] = max(prev["cost_price"], item["cost_price"])
+        prev["cost_price"] = (round(prev["_cost_sum"] / prev["stock"], 2) if prev["stock"]
+                              else max(prev["cost_price"], item["cost_price"]))
 
     if header is None:
         raise StockImportError("Sarlavha qatori topilmadi ('Код товара', 'Кол-во' ustunlari kerak)")
     if not merged:
         raise StockImportError("Faylda tovar qatorlari topilmadi")
+    for item in merged.values():
+        item.pop("_cost_sum", None)
     return list(merged.values())
