@@ -1253,6 +1253,142 @@ async def mark_followup_done(sid: str, user=Depends(require_roles("worker"))):
     return {"ok": True}
 
 
+class SaleUpdate(BaseModel):
+    quantity: int
+    product_price: float  # chegirmadan keyingi dona narxi
+    customer_name: str = ""
+    customer_surname: str = ""
+    customer_phone: str = ""
+
+
+async def _sync_pos_sale(row: dict, new_row: Optional[dict]):
+    """Eski `sales` qatori o'zgarganda POS cheki (pos_sales/pos_sale_items) ham moslanadi.
+    new_row=None — qator o'chirilgan."""
+    pos_sale_id = row.get("pos_sale_id")
+    if not pos_sale_id:
+        return
+    item = await db.pos_sale_items.find_one({"sale_id": pos_sale_id, "product_id": row.get("product_id")}, {"_id": 0})
+    if item:
+        if new_row is None:
+            await db.pos_sale_items.delete_one({"id": item["id"]})
+            await db.follow_ups.delete_many({"sale_item_id": item["id"]})
+        else:
+            await db.pos_sale_items.update_one({"id": item["id"]}, {"$set": {
+                "quantity": new_row["quantity"],
+                "unit_price": new_row["product_price"],
+                "discount_percent": new_row["discount_percent"],
+                "line_total": new_row["total"],
+                "discount_total": new_row["discount_total"],
+            }})
+    header = await db.pos_sales.find_one({"id": pos_sale_id}, {"_id": 0})
+    if not header:
+        return
+    items = await db.pos_sale_items.find({"sale_id": pos_sale_id}, {"_id": 0}).to_list(200)
+    if not items:
+        await db.pos_sales.delete_one({"id": pos_sale_id})
+        await db.follow_ups.delete_many({"sale_id": pos_sale_id})
+        if header.get("customer_id"):
+            await db.customers.update_one({"id": header["customer_id"]}, {"$inc": {"purchases_count": -1}})
+        return
+    subtotal = round(sum(float(i.get("line_total", 0) or 0) for i in items), 2)
+    discount = round(min(float(header.get("discount", 0) or 0), subtotal), 2)
+    update = {
+        "subtotal": subtotal,
+        "item_discount": round(sum(float(i.get("discount_total", 0) or 0) for i in items), 2),
+        "discount": discount,
+        "total": round(subtotal - discount, 2),
+    }
+    if new_row is not None:
+        update["customer_name"] = f"{new_row['customer_name']} {new_row['customer_surname']}".strip()
+        update["customer_phone"] = new_row["customer_phone"]
+    await db.pos_sales.update_one({"id": pos_sale_id}, {"$set": update})
+
+
+async def _log_sale_change(action: str, user: dict, before: dict, after: Optional[dict] = None):
+    await db.sale_audit_logs.insert_one({
+        "id": str(uuid.uuid4()),
+        "action": action,  # "edit" | "delete"
+        "sale_id": before["id"],
+        "before": before,
+        "after": after,
+        "edited_by_id": user["id"],
+        "edited_by_name": f"{user.get('name', '')} {user.get('surname', '')}".strip(),
+        "edited_at": datetime.now(timezone.utc).isoformat(),
+    })
+
+
+@api.put("/sales/{sid}")
+async def update_sale(sid: str, data: SaleUpdate, user=Depends(require_roles("director"))):
+    """Faqat director: sotuv qatorini tahrirlash — qoldiq, foyda va POS cheki qayta hisoblanadi."""
+    row = await db.sales.find_one({"id": sid}, {"_id": 0})
+    if not row:
+        raise HTTPException(404, "Sotuv topilmadi")
+    if data.quantity <= 0:
+        raise HTTPException(400, "Miqdor 0 dan katta bo'lishi kerak")
+    if data.product_price < 0:
+        raise HTTPException(400, "Narx manfiy bo'lmasligi kerak")
+
+    old_qty = int(row.get("quantity", 0) or 0)
+    delta = int(data.quantity) - old_qty
+    pid = row.get("product_id")
+    if delta > 0:
+        res = await db.products.update_one({"id": pid, "stock": {"$gte": delta}}, {"$inc": {"stock": -delta}})
+        if res.matched_count == 0:
+            product = await db.products.find_one({"id": pid}, {"_id": 0, "stock": 1})
+            if product:
+                raise HTTPException(400, f"Omborda yetarli emas. Qo'shimcha {delta} ta kerak, bor: {int(product.get('stock', 0) or 0)} ta")
+    elif delta < 0:
+        await db.products.update_one({"id": pid}, {"$inc": {"stock": -delta}})
+
+    qty = int(data.quantity)
+    unit = round(float(data.product_price), 2)
+    original = max(float(row.get("original_price") or row.get("product_price") or 0), unit)
+    cost = float(row.get("cost_price", 0) or 0)
+    customer = {
+        "customer_name": data.customer_name.strip(),
+        "customer_surname": data.customer_surname.strip(),
+        "customer_phone": data.customer_phone.strip(),
+    }
+    update = {
+        **customer,
+        "quantity": qty,
+        "product_price": unit,
+        "original_price": original,
+        "discount_percent": round((1 - unit / original) * 100, 2) if original > 0 else 0,
+        "discount_total": round((original - unit) * qty, 2),
+        "cost_total": round(cost * qty, 2),
+        "profit": round((unit - cost) * qty, 2),
+        "total": round(unit * qty, 2),
+        "edited_at": datetime.now(timezone.utc).isoformat(),
+        "edited_by": user["id"],
+    }
+    await db.sales.update_one({"id": sid}, {"$set": update})
+    # Mijoz ma'lumoti bitta chekdagi barcha qatorlarda bir xil bo'lishi kerak
+    if row.get("receipt_id"):
+        await db.sales.update_many({"receipt_id": row["receipt_id"]}, {"$set": customer})
+    new_row = {**row, **update}
+    await _sync_pos_sale(row, new_row)
+    await _log_sale_change("edit", user, row, new_row)
+    return new_row
+
+
+@api.delete("/sales/{sid}")
+async def delete_sale(sid: str, user=Depends(require_roles("director"))):
+    """Faqat director: sotuv qatorini o'chirish — mahsulot omborga qaytariladi."""
+    row = await db.sales.find_one({"id": sid}, {"_id": 0})
+    if not row:
+        raise HTTPException(404, "Sotuv topilmadi")
+    res = await db.sales.delete_one({"id": sid})
+    if res.deleted_count == 0:
+        raise HTTPException(404, "Sotuv topilmadi")
+    qty = int(row.get("quantity", 0) or 0)
+    if qty > 0 and row.get("product_id"):
+        await db.products.update_one({"id": row["product_id"]}, {"$inc": {"stock": qty}})
+    await _sync_pos_sale(row, None)
+    await _log_sale_change("delete", user, row)
+    return {"ok": True}
+
+
 # ---------- Attendance ----------
 @api.post("/attendance")
 async def attendance_punch(data: AttendanceIn, user=Depends(require_roles("worker"))):
