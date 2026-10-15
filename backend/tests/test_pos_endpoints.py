@@ -25,8 +25,6 @@ def worker(director_client):
     for w in workers:
         if w.get("email", "").startswith("test_pos_"):
             director_client.delete(f"{BASE_URL}/api/users/workers/{w['id']}")
-    if len(director_client.get(f"{BASE_URL}/api/users/workers").json()) >= 4:
-        pytest.skip("4 workers already exist, cannot create test worker")
     email, pw = f"test_pos_{uuid.uuid4().hex[:6]}@x.com", "Work1234"
     r = director_client.post(f"{BASE_URL}/api/users/workers",
                              json={"email": email, "password": pw, "name": "Pos", "surname": "Tester"})

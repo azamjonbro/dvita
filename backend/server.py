@@ -1558,9 +1558,6 @@ async def list_workers(user=Depends(require_roles("director", "worker", "admin")
 
 @api.post("/users/workers")
 async def create_worker(data: CreateWorker, user=Depends(require_roles("director", "admin"))):
-    count = await db.users.count_documents({"role": "worker"})
-    if count >= 4:
-        raise HTTPException(400, "Maksimal 4 ta ishchi bo'lishi mumkin")
     email = data.email.lower()
     if await db.users.find_one({"email": email}):
         raise HTTPException(400, "Bu email allaqachon mavjud")
@@ -2215,4 +2212,3 @@ if __name__ == "__main__":
         port=int(os.environ.get("PORT", "8000")),
         reload=False,
     )
-

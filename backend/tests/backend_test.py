@@ -257,23 +257,17 @@ class TestWorkerFlow:
         me = s.get(f"{BASE_URL}/api/auth/me").json()
         assert me["role"] == "worker"
 
-    def test_max_4_workers(self, worker_session):
+    def test_unlimited_worker_creation(self, worker_session):
         _, _, ds = worker_session
-        # try to spam create up to >4
         created = []
         for i in range(5):
             email = f"TEST_max_{uuid.uuid4().hex[:6]}@x.com"
             r = ds.post(f"{BASE_URL}/api/users/workers", json={
                 "email": email, "password": "P12345678", "name": "M", "surname": "x", "phone": "1"
             })
-            if r.status_code == 200:
-                created.append(r.json()["id"])
-            else:
-                assert r.status_code == 400
-                break
-        # after loop, count should be capped at 4
-        workers = ds.get(f"{BASE_URL}/api/users/workers").json()
-        assert len(workers) <= 4
+            assert r.status_code == 200, r.text
+            created.append(r.json()["id"])
+        assert len(created) == 5
         # cleanup
         for wid in created:
             ds.delete(f"{BASE_URL}/api/users/workers/{wid}")

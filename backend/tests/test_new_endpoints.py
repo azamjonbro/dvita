@@ -21,10 +21,6 @@ def worker_ctx(director_client, test_branch_id):
     for w in workers:
         if w.get("email", "").startswith("TEST_"):
             director_client.delete(f"{BASE_URL}/api/users/workers/{w['id']}")
-    # if still at cap, drop one non-test worker just to make space? No — skip instead
-    workers = director_client.get(f"{BASE_URL}/api/users/workers").json()
-    if len(workers) >= 4:
-        pytest.skip("4 workers already exist, cannot create test worker")
 
     wmail = f"TEST_newep_{uuid.uuid4().hex[:6]}@x.com"
     wpw = "Work1234"
